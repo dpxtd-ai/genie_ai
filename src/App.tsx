@@ -562,11 +562,7 @@ class Program
 * **Trade-offs:** Performance overhead compared to static calls (can be optimized using Expression Trees or source generators), and lack of compile-time type safety.`;
     }
 
-    return `### Answer to: "${question}"
-
-* **Direct Answer:** Regarding **"${question}"**, in modern software development and engineering, addressing this question involves adhering to modular separation of concerns, robust validation, and performance optimization.
-* **Architecture Tip:** To ground answers in your team's specific documents, upload your files (PDF, CSV, TXT, DOCX) in the **Upload Documents** tab to enable document-grounded vector responses with citations!`;
-  };
+ };
 
   // Option 2: AI Chat Query Execution
   const handleSendChat = async (e?: React.FormEvent) => {

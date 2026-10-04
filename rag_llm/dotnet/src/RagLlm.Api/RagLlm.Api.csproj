@@ -10,18 +10,19 @@
   <ItemGroup>
     <PackageReference Include="Microsoft.AspNetCore.OpenApi" Version="8.0.3" />
     <PackageReference Include="Swashbuckle.AspNetCore" Version="6.5.0" />
-    
+
     <!-- PostgreSQL with pgvector -->
     <PackageReference Include="Npgsql.EntityFrameworkCore.PostgreSQL" Version="8.0.2" />
     <PackageReference Include="Pgvector.EntityFrameworkCore" Version="0.2.1" />
     <PackageReference Include="Dapper" Version="2.1.35" />
-    
+
     <!-- SQL Server 2025 / Azure SQL -->
     <PackageReference Include="Microsoft.Data.SqlClient" Version="5.2.0" />
     <PackageReference Include="Microsoft.EntityFrameworkCore.SqlServer" Version="8.0.3" />
 
     <!-- AI & Semantic Kernel / REST -->
-    <PackageReference Include="Microsoft.SemanticKernel" Version="1.6.0" />
+    <PackageReference Include="Microsoft.SemanticKernel" Version="1.6.1" />
+
     <PackageReference Include="System.Text.Json" Version="8.0.3" />
   </ItemGroup>
 

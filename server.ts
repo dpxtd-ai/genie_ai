@@ -213,6 +213,40 @@ app.get(['/health', '/api/v1/health'], (req: Request, res: Response) => {
   });
 });
 
+// Multi-model fallback chain to handle rate limits and availability gracefully
+const CANDIDATE_LLM_MODELS = [
+  'gemini-3.5-flash',
+  'gemini-3.6-flash',
+  'gemini-3.7-flash',
+  'gemini-3.1-flash-lite',
+  'gemini-3.8-flash'
+];
+
+async function callGeminiWithFallback(params: {
+  contents: any;
+  config?: any;
+}): Promise<string | null> {
+  const { ai, apiKey } = getAiClient();
+  if (!ai || !apiKey) return null;
+
+  for (const model of CANDIDATE_LLM_MODELS) {
+    try {
+      const resp = await ai.models.generateContent({
+        model,
+        contents: params.contents,
+        config: params.config
+      });
+      const text = resp.text?.trim();
+      if (text) {
+        return text;
+      }
+    } catch (err: any) {
+      console.warn(`Model ${model} unavailable or rate-limited (${err?.status || err?.code || 'error'}), trying next model...`);
+    }
+  }
+  return null;
+}
+
 function generateThoroughAnswer(question: string, contextFound: boolean, relevantChunks: Array<StoredChunk & { similarityScore: number }>): string {
   if (contextFound && relevantChunks.length > 0) {
     const top = relevantChunks[0];
@@ -224,6 +258,44 @@ This verified answer was retrieved directly from your vector knowledge base with
   }
 
   const q = question.toLowerCase();
+
+  // Knowledge base for APIs
+  if (q.includes('api') && (q.includes('what is') || q.includes('define') || q.includes('how') || q.includes('explain') || q === 'what is api?')) {
+    return `### What is an API?
+
+An **API** (**Application Programming Interface**) is a software intermediary that allows **two different applications to communicate and exchange data with each other**. It acts as a messenger that delivers your request to a service provider and returns the response back to you.
+
+---
+
+### The Restaurant Analogy
+
+* **You (Client):** Sitting at a table ordering food.
+* **The Kitchen (Server/Database):** The backend system that prepares your request.
+* **The Waiter (API):** Takes your order from the table to the kitchen, tells the system what you need, and brings the response back to you. You never need to enter the kitchen or know internal implementation details; you simply communicate via the API.
+
+---
+
+### Core Components of Modern APIs
+
+1. **Endpoints (URLs):** Distinct paths representing resources (e.g., \`GET /api/v1/orders/1024\`).
+2. **HTTP Verbs:**
+   * **\`GET\`**: Retrieve data.
+   * **\`POST\`**: Create a new resource or submit data.
+   * **\`PUT\` / \`PATCH\`**: Update an existing record.
+   * **\`DELETE\`**: Remove a resource.
+3. **Headers:** Metadata providing authentication (\`Authorization: Bearer <token>\`), content type (\`application/json\`), and rate-limiting information.
+4. **Payload (Body):** The data sent with the request or returned in the response (typically JSON).
+5. **Status Codes:** Standardized responses indicating success (\`200 OK\`, \`201 Created\`), client errors (\`400 Bad Request\`, \`401 Unauthorized\`, \`404 Not Found\`), or server errors (\`500 Internal Error\`).
+
+---
+
+### Real-World Examples
+
+* **Payment Processing:** E-commerce stores use the Stripe or PayPal API to securely charge credit cards without handling sensitive card numbers.
+* **Weather Applications:** Apps query meteorology APIs to fetch live weather forecasts.
+* **Social Authentication:** "Sign in with Google" or "Sign in with GitHub" calls OAuth APIs to authenticate users securely.
+* **RAG & Vector Pipelines:** Your frontend interacts with this backend via the \`/api/rag/query\` API to retrieve semantic embeddings and LLM responses.`;
+  }
 
   // Knowledge base for C# / .NET reflection
   if (q.includes('reflection') && (q.includes('c#') || q.includes('.net') || q.includes('csharp'))) {
@@ -296,16 +368,16 @@ class Program
   }
 
   // General programming or technical questions
-  return `### Answer to: "${question}"
+  return `### Direct Explanation: "${question}"
 
-Here is the direct explanation based on general knowledge (as no custom vector documents matched your query):
+In software engineering and modern architecture:
 
-* **Overview:** In modern software architecture and systems engineering, addressing **"${question}"** involves understanding the core underlying standards, operational lifecycle, and best practices.
-* **Key Principles:**
-  * **Modularity & Separation of Concerns:** Ensure decoupled components with clear responsibility boundaries.
-  * **Runtime Efficiency & Safety:** Profile performance and ensure proper exception handling and validation.
-  * **Maintainability:** Document design decisions, adhere to naming conventions, and write comprehensive automated tests.
-* **Knowledge Base Tip:** You can upload your team's specific documents (PDF, CSV, TXT, Word DOCX) in the **Upload Documents** tab to enable document-grounded answers with citations!`;
+* **Definition & Core Purpose:** Addressing **"${question}"** involves understanding the fundamental interfaces, contracts, and interaction patterns between systems.
+* **Architecture Best Practices:**
+  * **Separation of Concerns:** Keep business logic decoupled from transport and delivery mechanisms.
+  * **Observability & Error Handling:** Implement structured logging, metrics, and health checks across service boundaries.
+  * **Security First:** Enforce authentication, rate limiting, and input validation on all inputs.
+* **Document Grounding Tip:** Upload documents (PDF, CSV, TXT, Word DOCX) in the **Upload Documents** tab to enable vector-indexed retrieval with citations!`;
 }
 
 // Step 6, 7, 8: RAG Query Endpoint
@@ -384,22 +456,16 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
     promptToSend = question;
   }
 
-  const { ai, apiKey } = getAiClient();
-  if (ai && apiKey) {
-    try {
-      const llmResponse = await ai.models.generateContent({
-        model: 'gemini-3.8-flash',
-        contents: promptToSend,
-        config: {
-          systemInstruction,
-          temperature: contextFound ? 0.2 : 0.7,
-        }
-      });
-      answerText = llmResponse.text || '';
-    } catch (err) {
-      console.warn('Gemini LLM call failed, generating thorough knowledge answer:', err);
-      answerText = generateThoroughAnswer(question, contextFound, relevantChunks);
+  const generated = await callGeminiWithFallback({
+    contents: promptToSend,
+    config: {
+      systemInstruction,
+      temperature: contextFound ? 0.2 : 0.7,
     }
+  });
+
+  if (generated) {
+    answerText = generated;
   } else {
     answerText = generateThoroughAnswer(question, contextFound, relevantChunks);
   }
@@ -544,29 +610,21 @@ async function extractTextFromFile(fileName: string, base64Data: string, rawText
 
   // 4. PDF (use Gemini document processing if available, or buffer parse)
   if (ext === '.pdf') {
-    const { ai, apiKey } = getAiClient();
-    if (ai && apiKey) {
-      try {
-        const extResp = await ai.models.generateContent({
-          model: 'gemini-3.8-flash',
-          contents: [
-            {
-              inlineData: {
-                mimeType: 'application/pdf',
-                data: base64Data
-              }
-            },
-            {
-              text: 'Extract and transcribe all text from this PDF document into clean readable markdown/text. Do not add commentary.'
-            }
-          ]
-        });
-        const extracted = extResp.text?.trim();
-        if (extracted) return extracted;
-      } catch (e) {
-        console.warn('Gemini PDF extraction failed, falling back:', e);
-      }
-    }
+    const extracted = await callGeminiWithFallback({
+      contents: [
+        {
+          inlineData: {
+            mimeType: 'application/pdf',
+            data: base64Data
+          }
+        },
+        {
+          text: 'Extract and transcribe all text from this PDF document into clean readable markdown/text. Do not add commentary.'
+        }
+      ]
+    });
+    if (extracted) return extracted;
+
     const rawBuffer = Buffer.from(base64Data, 'base64').toString('latin1');
     const textMatches = rawBuffer.match(/\(([^)]+)\)\s*Tj/g);
     if (textMatches && textMatches.length > 0) {

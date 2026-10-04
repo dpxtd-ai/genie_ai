@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  # Option A: PostgreSQL 16 with pgvector extension
+  postgres-pgvector:
+    image: pgvector/pgvector:pg16
+    container_name: rag-postgres-pgvector
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ragdb
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgvector-data:/var/lib/postgresql/data
+      - ./src/RagLlm.Api/Database/schema_pgvector.sql:/docker-entrypoint-initdb.d/init.sql
+
+  # Option B: ASP.NET Core API Service
+  rag-api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag-dotnet-api
+    restart: unless-stopped
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ConnectionStrings__PostgreSql=Host=postgres-pgvector;Port=5432;Database=ragdb;Username=postgres;Password=postgres
+      - Rag__VectorStoreProvider=PgVector
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    ports:
+      - "5000:8080"
+    depends_on:
+      - postgres-pgvector
+
+volumes:
+  pgvector-data:

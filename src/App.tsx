@@ -1,0 +1,942 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { marked } from 'marked';
+import {
+  UploadCloud,
+  MessageSquare,
+  FileText,
+  Trash2,
+  Send,
+  Sparkles,
+  Download,
+  Code,
+  CheckCircle2,
+  AlertCircle,
+  Folder,
+  FileCode,
+  Copy,
+  Check,
+  RefreshCw,
+  Info,
+  RotateCcw,
+  Sun,
+  Moon,
+  BookOpen,
+  Terminal,
+  ShieldCheck,
+  Cpu,
+  Layers,
+  HelpCircle,
+  Database
+} from 'lucide-react';
+
+// Configure marked for GitHub-Flavored Markdown
+marked.setOptions({
+  gfm: true,
+  breaks: true,
+});
+
+function renderFormattedMarkdown(text: string): string {
+  if (!text) return '';
+
+  const withCitations = text.replace(
+    /\[(?:Doc|Source):\s*([^#\]]+)?\s*#?(\d+)?\]/gi,
+    '<span class="rag-citation-badge">$&</span>'
+  );
+
+  try {
+    return marked.parse(withCitations) as string;
+  } catch (err) {
+    console.error('Markdown parse error:', err);
+    return text;
+  }
+}
+
+interface ChatMessage {
+  id: string;
+  sender: 'user' | 'assistant';
+  text: string;
+  timestamp: string;
+  contextFound?: boolean;
+  retrievedCount?: number;
+  sources?: any[];
+  citations?: any[];
+  executionMode?: string;
+  durationMs?: number;
+}
+
+interface StoredDoc {
+  id: string;
+  title: string;
+  fileName: string;
+  department: string;
+  characterCount: number;
+  estimatedTokens: number;
+  createdAt: string;
+  chunksCount: number;
+}
+
+interface CodeFileItem {
+  path: string;
+  name: string;
+  size: number;
+  isDir: boolean;
+  content?: string;
+}
+
+export default function App() {
+  const [theme, setTheme] = useState<'dark' | 'light'>(() => {
+    return (localStorage.getItem('genie_theme') as 'dark' | 'light') || 'dark';
+  });
+  const [activeOption, setActiveOption] = useState<'upload' | 'chat' | 'docs'>('chat');
+  const [showCodeModal, setShowCodeModal] = useState(false);
+
+  // Option 1: Upload Documents State
+  const [documents, setDocuments] = useState<StoredDoc[]>([]);
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadMessage, setUploadMessage] = useState<{ text: string; isError?: boolean } | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Option 2: AI Chat State
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
+    {
+      id: 'welcome',
+      sender: 'assistant',
+      text: 'Hello! I am Genie. How can I help you?',
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      contextFound: true
+    }
+  ]);
+  const [userInput, setUserInput] = useState('');
+  const [isAiThinking, setIsAiThinking] = useState(false);
+  const chatScrollRef = useRef<HTMLDivElement>(null);
+
+  // Code Modal State
+  const [codeFiles, setCodeFiles] = useState<CodeFileItem[]>([]);
+  const [selectedFile, setSelectedFile] = useState<CodeFileItem | null>(null);
+  const [copiedCode, setCopiedCode] = useState(false);
+  const [copiedBash, setCopiedBash] = useState<string | null>(null);
+
+  useEffect(() => {
+    fetchDocuments();
+    fetchCodeFiles();
+  }, []);
+
+  useEffect(() => {
+    localStorage.setItem('genie_theme', theme);
+  }, [theme]);
+
+  useEffect(() => {
+    if (chatScrollRef.current) {
+      chatScrollRef.current.scrollTop = chatScrollRef.current.scrollHeight;
+    }
+  }, [chatMessages, isAiThinking]);
+
+  const toggleTheme = () => {
+    setTheme(prev => prev === 'dark' ? 'light' : 'dark');
+  };
+
+  const fetchDocuments = async () => {
+    try {
+      const res = await fetch('/api/documents');
+      if (res.ok) {
+        const data = await res.json();
+        setDocuments(data);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const fetchCodeFiles = async () => {
+    try {
+      const res = await fetch('/api/rag/code-files');
+      if (res.ok) {
+        const data = await res.json();
+        setCodeFiles(data);
+        const first = data.find((f: CodeFileItem) => !f.isDir);
+        if (first) setSelectedFile(first);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  // Option 1: File Upload Handler
+  const handleFileUpload = async (file: File) => {
+    setIsUploading(true);
+    setUploadMessage(null);
+
+    const reader = new FileReader();
+
+    reader.onload = async () => {
+      try {
+        const result = reader.result as string;
+        const base64Data = result.includes(',') ? result.split(',')[1] : result;
+
+        const res = await fetch('/api/documents/upload-file', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            fileName: file.name,
+            base64Data,
+            title: file.name.replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' ')
+          })
+        });
+
+        const data = await res.json();
+
+        if (res.ok) {
+          setUploadMessage({
+            text: `Successfully ingested "${file.name}"! Created ${data.chunksCreated} vector embeddings.`
+          });
+          fetchDocuments();
+        } else {
+          setUploadMessage({ text: data.error || 'Failed to ingest file', isError: true });
+        }
+      } catch (err: any) {
+        setUploadMessage({ text: err.message || 'Error processing file', isError: true });
+      } finally {
+        setIsUploading(false);
+      }
+    };
+
+    reader.readAsDataURL(file);
+  };
+
+  const handleDeleteDocument = async (id: string) => {
+    try {
+      await fetch(`/api/documents/${id}`, { method: 'DELETE' });
+      fetchDocuments();
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleClearAllDocs = async () => {
+    if (!confirm('Are you sure you want to clean all documents and vector embeddings?')) return;
+    try {
+      await fetch('/api/documents/clear-all', { method: 'POST' });
+      setDocuments([]);
+      setUploadMessage({ text: 'Cleaned all vector store data. Ready for fresh deployment.' });
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  // Option 2: AI Chat Query Execution
+  const handleSendChat = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!userInput.trim() || isAiThinking) return;
+
+    const questionText = userInput.trim();
+    setUserInput('');
+
+    const userMsg: ChatMessage = {
+      id: Date.now().toString(),
+      sender: 'user',
+      text: questionText,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+    };
+
+    setChatMessages((prev) => [...prev, userMsg]);
+    setIsAiThinking(true);
+
+    try {
+      const res = await fetch('/api/rag/query', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          question: questionText,
+          minSimilarityScore: 0.50,
+          topK: 4,
+          userRoles: ['Public', 'InternalEmployee', 'ConfidentialAdmin']
+        })
+      });
+
+      if (!res.ok) {
+        throw new Error('API query failed');
+      }
+
+      const data = await res.json();
+
+      const assistantMsg: ChatMessage = {
+        id: (Date.now() + 1).toString(),
+        sender: 'assistant',
+        text: data.answer,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        contextFound: data.contextFound,
+        retrievedCount: data.retrievedChunksCount,
+        sources: data.sources,
+        citations: data.citations,
+        executionMode: data.executionMode,
+        durationMs: data.metrics?.totalDurationMs
+      };
+
+      setChatMessages((prev) => [...prev, assistantMsg]);
+    } catch (err: any) {
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: (Date.now() + 1).toString(),
+          sender: 'assistant',
+          text: `Error processing query: ${err.message || 'Unknown error'}. Please try again.`,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          contextFound: false
+        }
+      ]);
+    } finally {
+      setIsAiThinking(false);
+    }
+  };
+
+  const copyCode = (text: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedCode(true);
+    setTimeout(() => setCopiedCode(false), 2000);
+  };
+
+  const copyBashSnippet = (id: string, text: string) => {
+    navigator.clipboard.writeText(text);
+    setCopiedBash(id);
+    setTimeout(() => setCopiedBash(null), 2000);
+  };
+
+  const isDark = theme === 'dark';
+
+  return (
+    <div className={`min-h-screen flex flex-col font-sans transition-colors duration-200 ${isDark ? 'dark bg-slate-950 text-slate-100 selection:bg-indigo-600 selection:text-white' : 'light bg-slate-50 text-slate-900 selection:bg-indigo-500 selection:text-white'}`}>
+      {/* Top Header */}
+      <header className={`border-b sticky top-0 z-30 transition-colors backdrop-blur ${isDark ? 'border-slate-800/90 bg-slate-900/90' : 'border-slate-200/90 bg-white/90 shadow-xs'}`}>
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-lg bg-indigo-600 flex items-center justify-center font-bold text-white shadow-md shadow-indigo-600/30">
+              <Sparkles className="w-4 h-4" />
+            </div>
+            <div>
+              <h1 className="font-bold text-sm flex items-center gap-2">
+                <span className={isDark ? 'text-white' : 'text-slate-900'}>Genie AI Assistant</span>
+              </h1>
+            </div>
+          </div>
+
+          {/* Center 3-Option Switcher & Theme Toggle */}
+          <div className="flex items-center gap-2">
+            <div className={`flex items-center p-1 rounded-xl border ${isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-100 border-slate-200'}`}>
+              <button
+                onClick={() => setActiveOption('upload')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all ${
+                  activeOption === 'upload'
+                    ? 'bg-indigo-600 text-white font-semibold shadow-xs'
+                    : isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-900'
+                }`}>
+                <UploadCloud className="w-3.5 h-3.5" />
+                <span>1. Upload</span>
+              </button>
+
+              <button
+                onClick={() => setActiveOption('chat')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all ${
+                  activeOption === 'chat'
+                    ? 'bg-indigo-600 text-white font-semibold shadow-xs'
+                    : isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-900'
+                }`}>
+                <MessageSquare className="w-3.5 h-3.5" />
+                <span>2. AI Chat</span>
+              </button>
+
+              <button
+                onClick={() => setActiveOption('docs')}
+                className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all ${
+                  activeOption === 'docs'
+                    ? 'bg-indigo-600 text-white font-semibold shadow-xs'
+                    : isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-900'
+                }`}>
+                <BookOpen className="w-3.5 h-3.5" />
+                <span>3. Docs &amp; Interview</span>
+              </button>
+            </div>
+
+            {/* Dark / Light Mode Toggle Button */}
+            <button
+              onClick={toggleTheme}
+              className={`p-2 rounded-xl text-xs transition-colors border ${isDark ? 'bg-slate-900 hover:bg-slate-800 text-amber-400 border-slate-800' : 'bg-white hover:bg-slate-100 text-indigo-600 border-slate-200 shadow-xs'}`}
+              title={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}>
+              {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+            </button>
+
+            {/* Code Explorer / Export */}
+            <button
+              onClick={() => setShowCodeModal(true)}
+              className={`p-2 rounded-xl text-xs transition-colors border ${isDark ? 'bg-slate-900 hover:bg-slate-800 text-slate-300 border-slate-800' : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200 shadow-xs'}`}
+              title="Inspect rag_llm Codebase">
+              <Code className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      </header>
+
+      {/* Main App Container */}
+      <main className="flex-1 max-w-6xl w-full mx-auto px-4 sm:px-6 py-6">
+        
+        {/* ============================================================ */}
+        {/* OPTION 1: UPLOAD DOCUMENTS (PDF, CSV, TEXT, WORD DOCS)      */}
+        {/* ============================================================ */}
+        {activeOption === 'upload' && (
+          <div className="space-y-6 animate-fadeIn">
+            {/* Upload Box */}
+            <div className={`border rounded-2xl p-6 shadow-xl transition-colors ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm'}`}>
+              <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-3 mb-4">
+                <div>
+                  <h2 className="text-base font-bold flex items-center gap-2">
+                    <UploadCloud className="w-5 h-5 text-indigo-500" />
+                    <span>Upload Documents for Vector Ingestion</span>
+                  </h2>
+                  <p className={`text-xs mt-0.5 ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                    Upload your <strong>PDF</strong>, <strong>CSV</strong>, <strong>TXT</strong>, or <strong>Word (.docx)</strong> files to clean and store them in the vector database.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  {documents.length > 0 && (
+                    <button
+                      onClick={handleClearAllDocs}
+                      className={`px-3 py-1.5 border rounded-lg text-xs flex items-center gap-1.5 transition-colors ${isDark ? 'bg-rose-950/60 hover:bg-rose-900/60 text-rose-300 border-rose-800/80' : 'bg-rose-50 hover:bg-rose-100 text-rose-700 border-rose-200'}`}>
+                      <Trash2 className="w-3.5 h-3.5 text-rose-500" />
+                      <span>Clean All Data</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Drag & Drop Zone */}
+              <div
+                onDragOver={(e) => {
+                  e.preventDefault();
+                  setDragOver(true);
+                }}
+                onDragLeave={() => setDragOver(false)}
+                onDrop={(e) => {
+                  e.preventDefault();
+                  setDragOver(false);
+                  if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+                    handleFileUpload(e.dataTransfer.files[0]);
+                  }
+                }}
+                onClick={() => fileInputRef.current?.click()}
+                className={`border-2 border-dashed rounded-2xl p-8 text-center cursor-pointer transition-all ${
+                  dragOver
+                    ? 'border-indigo-500 bg-indigo-500/10'
+                    : isDark
+                    ? 'border-slate-700 hover:border-indigo-500 bg-slate-950/40'
+                    : 'border-slate-300 hover:border-indigo-500 bg-slate-50'
+                }`}>
+                <input
+                  ref={fileInputRef}
+                  type="file"
+                  accept=".pdf,.csv,.txt,.doc,.docx"
+                  onChange={(e) => {
+                    if (e.target.files && e.target.files.length > 0) {
+                      handleFileUpload(e.target.files[0]);
+                    }
+                  }}
+                  className="hidden"
+                />
+
+                <div className="space-y-3">
+                  <div className={`w-12 h-12 rounded-xl mx-auto flex items-center justify-center border shadow-md ${isDark ? 'bg-indigo-950/80 text-indigo-400 border-indigo-800' : 'bg-indigo-50 text-indigo-600 border-indigo-200'}`}>
+                    {isUploading ? (
+                      <RefreshCw className="w-6 h-6 animate-spin text-indigo-500" />
+                    ) : (
+                      <UploadCloud className="w-6 h-6" />
+                    )}
+                  </div>
+
+                  <div>
+                    <div className="text-sm font-semibold">
+                      {isUploading ? 'Extracting, chunking & embedding document...' : 'Click to select or drag and drop a document'}
+                    </div>
+                    <div className={`text-xs mt-1 ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                      Supports PDF (.pdf), CSV (.csv), Plain Text (.txt), Word (.docx)
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Upload Notification */}
+              {uploadMessage && (
+                <div
+                  className={`mt-4 p-3 rounded-xl text-xs flex items-center gap-2 border ${
+                    uploadMessage.isError
+                      ? isDark ? 'bg-rose-950/50 border-rose-800 text-rose-200' : 'bg-rose-50 border-rose-200 text-rose-700'
+                      : isDark ? 'bg-emerald-950/50 border-emerald-700 text-emerald-200' : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                  }`}>
+                  {uploadMessage.isError ? (
+                    <AlertCircle className="w-4 h-4 shrink-0" />
+                  ) : (
+                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                  )}
+                  <span>{uploadMessage.text}</span>
+                </div>
+              )}
+            </div>
+
+            {/* Ingested Documents List */}
+            <div className={`border rounded-2xl p-6 shadow-xl transition-colors ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm'}`}>
+              <div className="flex justify-between items-center mb-4">
+                <h3 className="text-sm font-bold flex items-center gap-2">
+                  <FileText className="w-4 h-4 text-indigo-500" />
+                  <span>Ingested Vector Documents ({documents.length})</span>
+                </h3>
+                <span className={`text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                  Ready for similarity search in the AI Chat tab
+                </span>
+              </div>
+
+              {documents.length === 0 ? (
+                <div className={`p-8 text-center text-xs ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>
+                  No documents in vector store. Ready for deployment. Upload your first document above.
+                </div>
+              ) : (
+                <div className={`divide-y ${isDark ? 'divide-slate-800/80' : 'divide-slate-100'}`}>
+                  {documents.map((doc) => (
+                    <div key={doc.id} className="py-3 flex justify-between items-center text-xs">
+                      <div>
+                        <div className={`font-semibold ${isDark ? 'text-slate-100' : 'text-slate-800'}`}>{doc.title}</div>
+                        <div className={`text-[11px] font-mono mt-0.5 ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>
+                          {doc.fileName} • {doc.chunksCount} chunks • ~{doc.estimatedTokens} tokens
+                        </div>
+                      </div>
+
+                      <div className="flex items-center gap-3">
+                        <span className={`px-2 py-0.5 font-mono text-[10px] rounded border ${isDark ? 'bg-slate-800 text-slate-300 border-slate-700' : 'bg-slate-100 text-slate-700 border-slate-200'}`}>
+                          {doc.department}
+                        </span>
+                        <button
+                          onClick={() => handleDeleteDocument(doc.id)}
+                          className={`p-1.5 rounded transition-colors ${isDark ? 'text-rose-400 hover:text-rose-300 hover:bg-rose-950/40' : 'text-rose-600 hover:text-rose-700 hover:bg-rose-50'}`}
+                          title="Delete from Vector Store">
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ============================================================ */}
+        {/* OPTION 2: AI CHAT (VECTOR SIMILARITY -> LLM WITH FALLBACK)   */}
+        {/* ============================================================ */}
+        {activeOption === 'chat' && (
+          <div className="space-y-4 flex flex-col h-[78vh] animate-fadeIn">
+            {/* Process Indicator Card */}
+            <div className={`border rounded-xl px-4 py-2.5 text-xs flex items-center justify-between transition-colors ${isDark ? 'bg-slate-900 border-slate-800 text-slate-300' : 'bg-white border-slate-200 text-slate-700 shadow-xs'}`}>
+              <div className="flex items-center gap-2">
+                <Info className="w-4 h-4 text-indigo-500 shrink-0" />
+                <span>
+                  <strong>Query Process:</strong> Vector similarity search is performed. If relevant chunks match, they are sent to the LLM with citations. If no context is found, your question is sent directly to the LLM.
+                </span>
+              </div>
+              <button
+                onClick={() => setChatMessages([])}
+                className={`text-[11px] transition-colors whitespace-nowrap ml-4 flex items-center gap-1 ${isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-500 hover:text-slate-800'}`}>
+                <RotateCcw className="w-3 h-3" />
+                <span>Clear Chat</span>
+              </button>
+            </div>
+
+            {/* Chat Thread */}
+            <div
+              ref={chatScrollRef}
+              className={`flex-1 border rounded-2xl p-4 sm:p-6 overflow-y-auto space-y-4 shadow-inner transition-colors ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-slate-100/70 border-slate-200'}`}>
+              {chatMessages.map((msg) => (
+                <div
+                  key={msg.id}
+                  className={`flex flex-col ${msg.sender === 'user' ? 'items-end' : 'items-start'}`}>
+                  {msg.sender === 'user' ? (
+                    <div className="max-w-xl bg-indigo-600 text-white rounded-2xl rounded-tr-sm px-4 py-2.5 text-xs shadow-md">
+                      {msg.text}
+                    </div>
+                  ) : (
+                    <div className={`max-w-2xl border rounded-2xl rounded-tl-sm p-4 text-xs space-y-2.5 shadow-md transition-colors ${isDark ? 'bg-slate-950 border-slate-800' : 'bg-white border-slate-200 shadow-xs'}`}>
+                      {/* Process Badge (Requirement 7) */}
+                      {msg.contextFound !== undefined && (
+                        <div className={`flex items-center justify-between gap-2 border-b pb-2 ${isDark ? 'border-slate-800/80' : 'border-slate-100'}`}>
+                          <span
+                            className={`px-2.5 py-0.5 rounded-full text-[10px] font-bold border flex items-center gap-1.5 ${
+                              msg.contextFound
+                                ? isDark ? 'bg-emerald-950 text-emerald-300 border-emerald-700/80' : 'bg-emerald-50 text-emerald-700 border-emerald-300'
+                                : isDark ? 'bg-amber-950 text-amber-300 border-amber-700/80' : 'bg-amber-50 text-amber-700 border-amber-300'
+                            }`}>
+                            {msg.contextFound ? (
+                              <>
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500"></span>
+                                <span>Context Found (Vector Search Matched)</span>
+                              </>
+                            ) : (
+                              <>
+                                <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
+                                <span>No Context Found (Sent Direct Prompt to LLM)</span>
+                              </>
+                            )}
+                          </span>
+
+                          <span className={`text-[10px] font-mono ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>
+                            {msg.timestamp}
+                          </span>
+                        </div>
+                      )}
+
+                      {/* Formatted Assistant Answer with Markdown Rendering */}
+                      <div
+                        className="rag-markdown"
+                        dangerouslySetInnerHTML={{ __html: renderFormattedMarkdown(msg.text) }}
+                      />
+                    </div>
+                  )}
+                </div>
+              ))}
+
+              {isAiThinking && (
+                <div className={`self-start border rounded-2xl p-4 text-xs flex items-center gap-2 ${isDark ? 'bg-slate-950 border-slate-800 text-slate-400' : 'bg-white border-slate-200 text-slate-600 shadow-xs'}`}>
+                  <RefreshCw className="w-3.5 h-3.5 text-indigo-500 animate-spin" />
+                  <span>Searching vector database &amp; generating answer...</span>
+                </div>
+              )}
+            </div>
+
+            {/* Prompt Form */}
+            <form onSubmit={handleSendChat} className="flex gap-2">
+              <input
+                type="text"
+                value={userInput}
+                onChange={(e) => setUserInput(e.target.value)}
+                placeholder="Ask a question (e.g. 'what is reflection in c#?' or ask about your uploaded docs)..."
+                className={`flex-1 border rounded-xl px-4 py-3 text-xs focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-colors ${isDark ? 'bg-slate-900 border-slate-800 text-slate-100 placeholder-slate-500' : 'bg-white border-slate-300 text-slate-900 placeholder-slate-400 shadow-xs'}`}
+              />
+              <button
+                type="submit"
+                disabled={isAiThinking || !userInput.trim()}
+                className="px-6 py-3 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all shadow-md shadow-indigo-600/20">
+                <Send className="w-3.5 h-3.5" />
+                <span>Send</span>
+              </button>
+            </form>
+          </div>
+        )}
+
+        {/* ============================================================ */}
+        {/* OPTION 3: TECHNICAL DOCS & INTERVIEW GUIDE                   */}
+        {/* ============================================================ */}
+        {activeOption === 'docs' && (
+          <div className="space-y-6 animate-fadeIn pb-12">
+            {/* Header Banner */}
+            <div className={`border rounded-2xl p-6 transition-colors ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm'}`}>
+              <div className="flex items-start justify-between">
+                <div>
+                  <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-[11px] font-mono font-semibold bg-indigo-500/10 text-indigo-500 border border-indigo-500/20 mb-2">
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    <span>Production Architecture &amp; System Design</span>
+                  </div>
+                  <h2 className="text-lg font-bold">Genie RAG AI Technical Docs &amp; Interviewer Guide</h2>
+                  <p className={`text-xs mt-1 max-w-3xl ${isDark ? 'text-slate-400' : 'text-slate-600'}`}>
+                    Everything you need to explain this system to an engineering interviewer: architecture diagrams, chunking mathematics, dual-path routing, scalability strategies, and copy-paste run commands.
+                  </p>
+                </div>
+
+                <a
+                  href="/api/rag/download-zip"
+                  download="rag_llm_angular_dotnet.zip"
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-md shadow-indigo-600/20 transition-all shrink-0">
+                  <Download className="w-4 h-4" />
+                  <span>Download Codebase (.ZIP)</span>
+                </a>
+              </div>
+            </div>
+
+            {/* 30-Second Elevator Pitch */}
+            <div className={`border rounded-2xl p-5 border-l-4 border-l-indigo-500 ${isDark ? 'bg-indigo-950/20 border-slate-800' : 'bg-indigo-50/50 border-slate-200'}`}>
+              <h3 className="text-xs font-bold uppercase tracking-wider text-indigo-500 flex items-center gap-1.5 mb-1.5">
+                <Sparkles className="w-4 h-4" />
+                <span>30-Second Interviewer Pitch</span>
+              </h3>
+              <p className={`text-xs leading-relaxed italic ${isDark ? 'text-slate-200' : 'text-slate-800'}`}>
+                "I designed and built <strong>Genie</strong>, an enterprise RAG assistant with React, Angular, and .NET. It ingests multi-format enterprise files (PDF, CSV, TXT, Word DOCX), chunks them using sentence-aware sliding windows with 20% overlap, and indexes them with 768-dimensional Gemini embeddings. At query time, it computes cosine similarity with role-based security filters. If relevant context exists (&ge; 0.50), it injects cited chunks into Gemini 3.8 Flash. If no context exists, it gracefully routes the prompt directly to the LLM to prevent false hallucinations."
+              </p>
+            </div>
+
+            {/* 8-Step Lifecycle Grid */}
+            <div className={`border rounded-2xl p-6 ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm'}`}>
+              <h3 className="text-sm font-bold flex items-center gap-2 mb-4">
+                <Layers className="w-4 h-4 text-indigo-500" />
+                <span>The 8-Step RAG Pipeline Execution Flow</span>
+              </h3>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
+                <div className={`p-3.5 rounded-xl border ${isDark ? 'bg-slate-950/80 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="font-bold text-indigo-500 mb-1">1. Multi-Format Ingestion</div>
+                  <p className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                    Parses PDF via Gemini, DOCX via JSZip XML extraction, and CSV into key-value records.
+                  </p>
+                </div>
+
+                <div className={`p-3.5 rounded-xl border ${isDark ? 'bg-slate-950/80 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="font-bold text-indigo-500 mb-1">2. Sanitization</div>
+                  <p className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                    Cleans zero-width characters, excessive whitespace, and preserves code fences &amp; headers.
+                  </p>
+                </div>
+
+                <div className={`p-3.5 rounded-xl border ${isDark ? 'bg-slate-950/80 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="font-bold text-indigo-500 mb-1">3. 20% Overlap Chunking</div>
+                  <p className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                    350-450 token chunks with 70-80 token overlap so definitions cut across splits aren't lost.
+                  </p>
+                </div>
+
+                <div className={`p-3.5 rounded-xl border ${isDark ? 'bg-slate-950/80 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="font-bold text-indigo-500 mb-1">4. 768-D Embeddings</div>
+                  <p className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                    L2-normalized dense embeddings via gemini-embedding-2-preview for fast dot products.
+                  </p>
+                </div>
+
+                <div className={`p-3.5 rounded-xl border ${isDark ? 'bg-slate-950/80 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="font-bold text-indigo-500 mb-1">5. Pre-Query RBAC</div>
+                  <p className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                    Security classification check runs <em>before</em> retrieval so unauthorized data never leaks.
+                  </p>
+                </div>
+
+                <div className={`p-3.5 rounded-xl border ${isDark ? 'bg-slate-950/80 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="font-bold text-indigo-500 mb-1">6. Cosine Similarity</div>
+                  <p className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                    Dot product similarity filter (&ge; 0.50 threshold) takes Top-4 highest ranked chunks.
+                  </p>
+                </div>
+
+                <div className={`p-3.5 rounded-xl border ${isDark ? 'bg-slate-950/80 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="font-bold text-indigo-500 mb-1">7. Dual Routing Guardrail</div>
+                  <p className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                    Context found &rarr; cited RAG answer. No context &rarr; direct LLM prompt without hallucinating!
+                  </p>
+                </div>
+
+                <div className={`p-3.5 rounded-xl border ${isDark ? 'bg-slate-950/80 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="font-bold text-indigo-500 mb-1">8. Source Verification</div>
+                  <p className={isDark ? 'text-slate-400' : 'text-slate-600'}>
+                    Extracts [Doc: Title #Idx] tags and links them back to physical vector chunks for audit.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            {/* How to Run Commands */}
+            <div className={`border rounded-2xl p-6 ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm'}`}>
+              <h3 className="text-sm font-bold flex items-center gap-2 mb-3">
+                <Terminal className="w-4 h-4 text-indigo-500" />
+                <span>How to Run Locally (Developer Commands)</span>
+              </h3>
+
+              <div className="space-y-3 text-xs font-mono">
+                {/* 1. React & Express */}
+                <div className={`p-3 rounded-xl border ${isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="flex justify-between items-center mb-1 text-[11px] font-sans font-semibold text-indigo-500">
+                    <span>1. Run Full-Stack React + Express Server (Port 3000)</span>
+                    <button
+                      onClick={() => copyBashSnippet('react', 'npm install\nnpm run dev')}
+                      className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-slate-200 font-sans">
+                      {copiedBash === 'react' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                      <span>{copiedBash === 'react' ? 'Copied' : 'Copy'}</span>
+                    </button>
+                  </div>
+                  <div className={isDark ? 'text-slate-300' : 'text-slate-700'}>
+                    npm install<br />
+                    npm run dev
+                  </div>
+                </div>
+
+                {/* 2. .NET 9 API */}
+                <div className={`p-3 rounded-xl border ${isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="flex justify-between items-center mb-1 text-[11px] font-sans font-semibold text-indigo-500">
+                    <span>2. Run ASP.NET Core 9.0 Web API (Port 5000 / Swagger)</span>
+                    <button
+                      onClick={() => copyBashSnippet('dotnet', 'cd rag_llm/dotnet/src/RagLlm.Api\ndotnet restore\ndotnet run')}
+                      className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-slate-200 font-sans">
+                      {copiedBash === 'dotnet' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                      <span>{copiedBash === 'dotnet' ? 'Copied' : 'Copy'}</span>
+                    </button>
+                  </div>
+                  <div className={isDark ? 'text-slate-300' : 'text-slate-700'}>
+                    cd rag_llm/dotnet/src/RagLlm.Api<br />
+                    dotnet restore<br />
+                    dotnet run
+                  </div>
+                </div>
+
+                {/* 3. Angular 19 */}
+                <div className={`p-3 rounded-xl border ${isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="flex justify-between items-center mb-1 text-[11px] font-sans font-semibold text-indigo-500">
+                    <span>3. Run Angular 19 Client SPA (Port 4200)</span>
+                    <button
+                      onClick={() => copyBashSnippet('angular', 'cd rag_llm/angular\nnpm install\nnpm start')}
+                      className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-slate-200 font-sans">
+                      {copiedBash === 'angular' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                      <span>{copiedBash === 'angular' ? 'Copied' : 'Copy'}</span>
+                    </button>
+                  </div>
+                  <div className={isDark ? 'text-slate-300' : 'text-slate-700'}>
+                    cd rag_llm/angular<br />
+                    npm install<br />
+                    npm start
+                  </div>
+                </div>
+
+                {/* 4. PostgreSQL pgvector */}
+                <div className={`p-3 rounded-xl border ${isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="flex justify-between items-center mb-1 text-[11px] font-sans font-semibold text-indigo-500">
+                    <span>4. Start PostgreSQL with pgvector (Docker)</span>
+                    <button
+                      onClick={() => copyBashSnippet('docker', 'docker run -d --name rag-pgvector -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=ragdb -p 5432:5432 pgvector/pgvector:pg16')}
+                      className="flex items-center gap-1 text-[11px] text-slate-400 hover:text-slate-200 font-sans">
+                      {copiedBash === 'docker' ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                      <span>{copiedBash === 'docker' ? 'Copied' : 'Copy'}</span>
+                    </button>
+                  </div>
+                  <div className={isDark ? 'text-slate-300' : 'text-slate-700'}>
+                    docker run -d --name rag-pgvector -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=ragdb -p 5432:5432 pgvector/pgvector:pg16
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Deep-Dive Interview Questions & Model Answers */}
+            <div className={`border rounded-2xl p-6 ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm'}`}>
+              <h3 className="text-sm font-bold flex items-center gap-2 mb-4">
+                <HelpCircle className="w-4 h-4 text-indigo-500" />
+                <span>Top Interview Questions &amp; Model Answers</span>
+              </h3>
+
+              <div className="space-y-4 text-xs">
+                <div className={`p-4 rounded-xl border ${isDark ? 'bg-slate-950/60 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="font-bold text-sm text-indigo-500 mb-1">
+                    Q1: How do you prevent hallucinations in your RAG pipeline?
+                  </div>
+                  <div className={`leading-relaxed space-y-1.5 ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
+                    <p><strong>1. Strict Prompt Grounding:</strong> When context chunks match, the LLM prompt enforces zero outside assumptions and requires bracket citations [Doc: Title #Idx].</p>
+                    <p><strong>2. Deterministic Cosine Thresholding (0.50):</strong> Low-relevance noise is never injected into the context window.</p>
+                    <p><strong>3. Low Temperature (0.2):</strong> RAG queries run at 0.2 temperature for high factual accuracy and low creativity.</p>
+                    <p><strong>4. Dual-Path Fallback:</strong> If no documents match, the pipeline openly routes directly to the LLM instead of making up a fake document.</p>
+                  </div>
+                </div>
+
+                <div className={`p-4 rounded-xl border ${isDark ? 'bg-slate-950/60 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="font-bold text-sm text-indigo-500 mb-1">
+                    Q2: Why use a 20% chunk overlap? What failure does it prevent?
+                  </div>
+                  <div className={`leading-relaxed ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
+                    If an essential sentence or rule (e.g., "Severance pay is strictly granted only after 12 months") is split between the end of Chunk 1 and the start of Chunk 2 without overlap, both chunks lose semantic coherence. The embedding of each partial sentence scores poorly in similarity search, causing retrieval to miss the answer. A 20% sliding window (~70-80 tokens) guarantees that boundary phrases exist together in at least one chunk.
+                  </div>
+                </div>
+
+                <div className={`p-4 rounded-xl border ${isDark ? 'bg-slate-950/60 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
+                  <div className="font-bold text-sm text-indigo-500 mb-1">
+                    Q3: How would you scale this vector database to 10 million documents?
+                  </div>
+                  <div className={`leading-relaxed space-y-1.5 ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
+                    <p><strong>1. HNSW Indexes in pgvector:</strong> Replace flat linear distance calculations with Hierarchical Navigable Small World graphs for &lt;10ms Approximate Nearest Neighbor (ANN) search.</p>
+                    <p><strong>2. Table Partitioning:</strong> Partition vector tables by Department/Tenant to restrict search scope.</p>
+                    <p><strong>3. Redis Vector Caching:</strong> Cache query embeddings and frequent question answers.</p>
+                    <p><strong>4. Vector Quantization:</strong> Apply scalar (int8) quantization to compress 768-dimension floats by 75% in memory.</p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
+      </main>
+
+      {/* Code Modal */}
+      {showCodeModal && (
+        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className={`border rounded-2xl max-w-4xl w-full h-[85vh] flex flex-col overflow-hidden shadow-2xl transition-colors ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
+            <div className={`p-4 border-b flex justify-between items-center ${isDark ? 'border-slate-800' : 'border-slate-200'}`}>
+              <div className="flex items-center gap-2">
+                <Code className="w-4 h-4 text-indigo-500" />
+                <h3 className="font-bold text-sm">rag_llm Codebase (Angular &amp; .NET)</h3>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <a
+                  href="/api/rag/download-zip"
+                  download="rag_llm_angular_dotnet.zip"
+                  className={`px-3 py-1 border rounded-lg text-xs flex items-center gap-1.5 transition-colors ${isDark ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700' : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'}`}>
+                  <Download className="w-3.5 h-3.5" />
+                  <span>Download ZIP</span>
+                </a>
+                <button
+                  onClick={() => setShowCodeModal(false)}
+                  className={`p-1 rounded-lg ${isDark ? 'text-slate-400 hover:text-white' : 'text-slate-500 hover:text-slate-900'}`}>
+                  ✕
+                </button>
+              </div>
+            </div>
+
+            <div className="flex-1 grid grid-cols-12 overflow-hidden">
+              {/* File Tree */}
+              <div className={`col-span-4 border-r p-3 overflow-y-auto font-mono text-xs space-y-1 ${isDark ? 'border-slate-800' : 'border-slate-200 bg-slate-50'}`}>
+                {codeFiles.map((file, i) => (
+                  <div
+                    key={i}
+                    onClick={() => !file.isDir && setSelectedFile(file)}
+                    className={`flex items-center gap-1.5 px-2 py-1 rounded cursor-pointer ${
+                      file.isDir
+                        ? isDark ? 'text-slate-500 font-bold' : 'text-slate-400 font-bold'
+                        : selectedFile?.path === file.path
+                        ? 'bg-indigo-600 text-white font-medium'
+                        : isDark ? 'text-slate-300 hover:bg-slate-800' : 'text-slate-700 hover:bg-slate-200'
+                    }`}>
+                    {file.isDir ? (
+                      <Folder className="w-3 h-3 text-amber-500 shrink-0" />
+                    ) : (
+                      <FileCode className="w-3 h-3 text-indigo-500 shrink-0" />
+                    )}
+                    <span className="truncate text-[11px]">{file.path}</span>
+                  </div>
+                ))}
+              </div>
+
+              {/* Code Preview */}
+              <div className={`col-span-8 flex flex-col overflow-hidden ${isDark ? 'bg-slate-950' : 'bg-slate-900 text-slate-100'}`}>
+                {selectedFile ? (
+                  <>
+                    <div className="p-2 border-b border-slate-800 flex justify-between items-center text-xs font-mono text-slate-400">
+                      <span>{selectedFile.path}</span>
+                      <button
+                        onClick={() => copyCode(selectedFile.content || '')}
+                        className="px-2 py-0.5 rounded bg-slate-800 text-slate-300 hover:text-white flex items-center gap-1">
+                        {copiedCode ? <Check className="w-3 h-3 text-emerald-400" /> : <Copy className="w-3 h-3" />}
+                        <span>{copiedCode ? 'Copied' : 'Copy'}</span>
+                      </button>
+                    </div>
+                    <pre className="flex-1 p-3 overflow-auto font-mono text-[11px] text-slate-200 leading-relaxed">
+                      <code>{selectedFile.content}</code>
+                    </pre>
+                  </>
+                ) : (
+                  <div className="flex-1 flex items-center justify-center text-xs text-slate-500">
+                    Select a file to inspect.
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

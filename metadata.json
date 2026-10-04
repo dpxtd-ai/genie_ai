@@ -1,0 +1,6 @@
+{
+  "name": "RAG Architecture & Pipeline Studio (.NET + Angular)",
+  "description": "Enterprise Retrieval-Augmented Generation (RAG) platform with ASP.NET Core API and Angular client codebase, PostgreSQL pgvector and SQL Server vector integration, interactive pipeline execution, embeddings, and citation validation.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

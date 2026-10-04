@@ -37,11 +37,29 @@ jobs:
         with:
           node-version: 20
 
-      - name: Install dependencies
-        run: npm install
+      - name: Install root dependencies
+        run: npm install --legacy-peer-deps
 
       - name: Build Vite application
         run: npm run build
+
+      # Build & Validate Angular 19 Client
+      - name: Build Angular Client
+        run: |
+          cd rag_llm/angular
+          npm install --legacy-peer-deps
+          npm run build
+
+      # Setup and Build .NET 8.0 Web API
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build .NET Web API
+        run: |
+          dotnet restore rag_llm/dotnet/src/RagLlm.Api/RagLlm.Api.csproj
+          dotnet build rag_llm/dotnet/src/RagLlm.Api/RagLlm.Api.csproj --configuration Release
 
       - name: Setup Pages
         uses: actions/configure-pages@v5

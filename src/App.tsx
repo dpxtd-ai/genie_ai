@@ -905,12 +905,7 @@ class Program
           <div className="space-y-4 flex flex-col h-[78vh] animate-fadeIn">
             {/* Process Indicator Card */}
             <div className={`border rounded-xl px-4 py-2.5 text-xs flex items-center justify-between transition-colors ${isDark ? 'bg-slate-900 border-slate-800 text-slate-300' : 'bg-white border-slate-200 text-slate-700 shadow-xs'}`}>
-              <div className="flex items-center gap-2">
-                <Info className="w-4 h-4 text-indigo-500 shrink-0" />
-                <span>
-                  <strong>Query Process:</strong> Vector similarity search is performed. If relevant chunks match, they are sent to the LLM with citations. If no context is found, your question is sent directly to the LLM.
-                </span>
-              </div>
+               
               <button
                 onClick={() => setChatMessages([])}
                 className={`text-[11px] transition-colors whitespace-nowrap ml-4 flex items-center gap-1 ${isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-500 hover:text-slate-800'}`}>

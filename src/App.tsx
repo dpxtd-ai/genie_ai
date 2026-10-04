@@ -561,7 +561,7 @@ class Program
 * **Advantages:** High runtime flexibility, ability to build generic libraries, and dynamic extensibility.
 * **Trade-offs:** Performance overhead compared to static calls (can be optimized using Expression Trees or source generators), and lack of compile-time type safety.`;
     }
-
+   return `### Answer to: "${question}"
  };
 
   // Option 2: AI Chat Query Execution

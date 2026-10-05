@@ -138,6 +138,63 @@ export default function App() {
   const [testingKey, setTestingKey] = useState(false);
   const [testResult, setTestResult] = useState<{ success?: boolean; message?: string } | null>(null);
 
+  // Direct Browser Gemini Caller (for Static GitHub Pages / Frontend Deployment)
+  const callGeminiDirectlyFromBrowser = async (
+    apiKey: string,
+    prompt: string,
+    systemInstruction?: string
+  ): Promise<string> => {
+    const models = [
+      'gemini-3.6-flash',
+      'gemini-3.8-flash',
+      'gemini-3.1-flash-lite',
+      'gemini-flash-latest'
+    ];
+
+    let lastError = '';
+
+    for (const model of models) {
+      try {
+        const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${encodeURIComponent(apiKey.trim())}`;
+        const payload: any = {
+          contents: [
+            {
+              role: 'user',
+              parts: [{ text: prompt }]
+            }
+          ]
+        };
+        if (systemInstruction) {
+          payload.systemInstruction = {
+            parts: [{ text: systemInstruction }]
+          };
+        }
+
+        const resp = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-goog-api-key': apiKey.trim()
+          },
+          body: JSON.stringify(payload)
+        });
+
+        if (resp.ok) {
+          const data = await resp.json();
+          const text = data.candidates?.[0]?.content?.parts?.[0]?.text;
+          if (text) return text.trim();
+        } else {
+          const errJson = await resp.json().catch(() => ({}));
+          lastError = errJson.error?.message || `HTTP ${resp.status} ${resp.statusText}`;
+        }
+      } catch (e: any) {
+        lastError = e?.message || String(e);
+      }
+    }
+
+    throw new Error(lastError || 'Gemini request could not be completed.');
+  };
+
   const handleTestKey = async () => {
     if (!keyInput.trim()) {
       setTestResult({ success: false, message: 'Please enter an API key to test.' });
@@ -145,28 +202,54 @@ export default function App() {
     }
     setTestingKey(true);
     setTestResult(null);
+
+    // 1. Try server-side validation first (for Node/Cloud Run/Local environments)
     try {
       const res = await fetch('/api/gemini/validate-key', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ apiKey: keyInput.trim() })
       });
-      const data = await res.json();
-      if (data.valid) {
+      if (res.ok) {
+        const data = await res.json();
+        if (data.valid) {
+          setTestResult({
+            success: true,
+            message: `Authentication succeeded! Model "${data.modelUsed}" responded successfully.`
+          });
+          setTestingKey(false);
+          return;
+        } else {
+          setTestResult({
+            success: false,
+            message: data.message || data.error || 'Key authentication failed.'
+          });
+          setTestingKey(false);
+          return;
+        }
+      }
+    } catch {
+      // Backend endpoint not found (expected when hosted statically on GitHub Pages)
+    }
+
+    // 2. Direct browser test (for static GitHub Pages hosting)
+    try {
+      const text = await callGeminiDirectlyFromBrowser(keyInput.trim(), 'Respond with: "Gemini connected successfully!"');
+      if (text) {
         setTestResult({
           success: true,
-          message: `Authentication succeeded! Model "${data.modelUsed}" responded successfully.`
+          message: `Direct browser connection succeeded! Gemini response: "${text}". Your key is active and ready.`
         });
       } else {
         setTestResult({
           success: false,
-          message: data.message || data.error || 'Key authentication failed.'
+          message: 'Direct API call did not return a response.'
         });
       }
-    } catch {
+    } catch (directErr: any) {
       setTestResult({
         success: false,
-        message: 'Could not connect to validation endpoint. Please ensure backend server is running.'
+        message: `Validation failed: ${directErr.message || String(directErr)}`
       });
     } finally {
       setTestingKey(false);
@@ -601,10 +684,34 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
     const contextFound = maxMatch >= 0.35 && bestChunk !== null;
     let answerText = '';
 
-    if (contextFound && bestChunk) {
-      answerText = `Based on [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}], here is the relevant guidance:\n\n${bestChunk.content}\n\n*(Retrieved via Client-Side Vector Engine with ${(maxMatch * 100).toFixed(0)}% keyword match)*`;
+    // If running on static host (GitHub Pages) and user has configured a custom key:
+    if (customApiKey) {
+      try {
+        let systemPrompt = '';
+        let promptToSend = '';
+
+        if (contextFound && bestChunk) {
+          systemPrompt = `You are Genie, a trusted enterprise AI assistant. Answer the user question accurately and truthfully based strictly on the retrieved document context below. When stating facts from a chunk, cite your source using [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}].`;
+          promptToSend = `=== RETRIEVED CONTEXT ===\n[Doc: ${bestChunk.title} #${bestChunk.chunkIndex}]\n${bestChunk.content}\n\n=== USER QUESTION ===\n${questionText}`;
+        } else {
+          // Requirement #7: If no context found with vector search then same input text send to llm.
+          systemPrompt = `You are Genie, an expert AI software engineer and knowledgeable assistant. Answer the user's question clearly, thoroughly, and practically using structured markdown headings (###), bold terms, and code snippets where appropriate.`;
+          promptToSend = questionText;
+        }
+
+        const llmResponse = await callGeminiDirectlyFromBrowser(customApiKey, promptToSend, systemPrompt);
+        if (llmResponse) {
+          answerText = llmResponse;
+        }
+      } catch (geminiErr: any) {
+        answerText = `### Direct Gemini Request Notice\n\nThe query was routed to Gemini LLM directly from your browser, but returned an error:\n* **Reason:** ${geminiErr.message || String(geminiErr)}\n\nPlease click **AI Key** in the top bar to test or update your key.`;
+      }
     } else {
-      answerText = `### AI Service Notice (Requirement #7)\n\nNo relevant vector documents were found matching **"${questionText}"**.\n\n* **Live LLM Inference:** In client-only static hosting mode, live AI calls require connecting to the backend API or supplying an active Gemini API key in **AI Key Settings**.\n* **Document Grounding:** Upload documents in the **Upload Documents** tab to index them into vector storage and enable grounded responses with verified citations.`;
+      if (contextFound && bestChunk) {
+        answerText = `Based on [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}], here is the relevant guidance:\n\n${bestChunk.content}\n\n*(Retrieved via Client-Side Vector Engine with ${(maxMatch * 100).toFixed(0)}% keyword match)*`;
+      } else {
+        answerText = `### AI Service Notice (Requirement #7)\n\nNo relevant vector documents were found matching **"${questionText}"**.\n\n* **Live LLM Inference:** You are running on GitHub Pages (static host). Click the **AI Key** button in the top navigation bar and enter your Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey) to enable real-time dynamic AI generation for any question.\n* **Document Grounding:** Upload documents in the **Upload Documents** tab to index them into vector storage.`;
+      }
     }
 
     setChatMessages((prev) => [

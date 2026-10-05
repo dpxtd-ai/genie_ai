@@ -14,8 +14,8 @@ const PORT = 3000;
 app.use(express.json({ limit: '15mb' }));
 
 // Initialize GoogleGenAI SDK on server side with User-Agent header as required
-function getAiClient(): { ai: GoogleGenAI | null; apiKey: string } {
-  const key = process.env.GEMINI_API_KEY || '';
+function getAiClient(customKey?: string): { ai: GoogleGenAI | null; apiKey: string } {
+  const key = (customKey && customKey.trim().length > 0) ? customKey.trim() : (process.env.GEMINI_API_KEY || '');
   if (!key) return { ai: null, apiKey: '' };
   try {
     return {
@@ -222,12 +222,20 @@ const CANDIDATE_LLM_MODELS = [
   'gemini-3.8-flash'
 ];
 
-async function callGeminiWithFallback(params: {
-  contents: any;
-  config?: any;
-}): Promise<string | null> {
-  const { ai, apiKey } = getAiClient();
-  if (!ai || !apiKey) return null;
+let lastLlmErrorDetails: string | null = null;
+
+async function callGeminiWithFallback(
+  params: {
+    contents: any;
+    config?: any;
+  },
+  customApiKey?: string
+): Promise<string | null> {
+  const { ai, apiKey } = getAiClient(customApiKey);
+  if (!ai || !apiKey) {
+    lastLlmErrorDetails = 'No GEMINI_API_KEY environment variable detected on server.';
+    return null;
+  }
 
   for (const model of CANDIDATE_LLM_MODELS) {
     try {
@@ -238,147 +246,97 @@ async function callGeminiWithFallback(params: {
       });
       const text = resp.text?.trim();
       if (text) {
+        lastLlmErrorDetails = null;
         return text;
       }
     } catch (err: any) {
-      console.warn(`Model ${model} unavailable or rate-limited (${err?.status || err?.code || 'error'}), trying next model...`);
+      const errorMsg = err?.message || String(err);
+      lastLlmErrorDetails = `Model ${model} failed (${err?.status || err?.code || 'error'}): ${errorMsg}`;
+      console.warn(`Model ${model} unavailable (${err?.status || err?.code || 'error'}), trying next model...`);
     }
   }
   return null;
 }
 
-function generateThoroughAnswer(question: string, contextFound: boolean, relevantChunks: Array<StoredChunk & { similarityScore: number }>): string {
-  if (contextFound && relevantChunks.length > 0) {
-    const top = relevantChunks[0];
-    return `Based on [Doc: ${top.documentTitle} #${top.chunkIndex}], here is the relevant guidance:
+function formatDirectLlmFallbackResponse(
+  question: string,
+  errorDetail: string | null
+): string {
+  let explanation = '';
+  if (errorDetail?.includes('ACCESS_TOKEN_TYPE_UNSUPPORTED') || errorDetail?.includes('API_KEY_SERVICE_BLOCKED') || errorDetail?.includes('401')) {
+    explanation = `
 
-${top.content}
+---
 
-This verified answer was retrieved directly from your vector knowledge base with a similarity score of ${(top.similarityScore * 100).toFixed(1)}%.`;
+> ⚠️ **Google Cloud Authentication Notice ('401 ACCESS_TOKEN_TYPE_UNSUPPORTED' / 'API_KEY_SERVICE_BLOCKED')**:
+> The API key being used is blocked from accessing the Google Generative Language API.
+> 
+> **Why this happens:**
+> 1. In Google Cloud Console, this API key has **"API restrictions"** enabled where **"Generative Language API"** is not permitted.
+> 2. Or, if this key was previously committed to a public Git repository, Google Cloud's automated secret scanner permanently blocked it from Generative AI endpoints for security.
+> 
+> **How to fix in 1 minute:**
+> 1. Open [Google AI Studio API Keys](https://aistudio.google.com/apikey).
+> 2. Click **"Create API key"** and select **"Create in new project"** (creates an unrestricted, active key).
+> 3. Click the **"AI Key"** button in the top navigation bar of this app, paste the new key, and click **Save Key**.`;
   }
 
-  const q = question.toLowerCase();
+  return `### AI Generation Notice
 
-  // Knowledge base for APIs
-  if (q.includes('api') && (q.includes('what is') || q.includes('define') || q.includes('how') || q.includes('explain') || q === 'what is api?')) {
-    return `### What is an API?
+No relevant vector documents were found in the knowledge base matching **"${question}"**. In accordance with **Requirement #7**, the query was routed directly to the Gemini LLM.
 
-An **API** (**Application Programming Interface**) is a software intermediary that allows **two different applications to communicate and exchange data with each other**. It acts as a messenger that delivers your request to a service provider and returns the response back to you.
-
----
-
-### The Restaurant Analogy
-
-* **You (Client):** Sitting at a table ordering food.
-* **The Kitchen (Server/Database):** The backend system that prepares your request.
-* **The Waiter (API):** Takes your order from the table to the kitchen, tells the system what you need, and brings the response back to you. You never need to enter the kitchen or know internal implementation details; you simply communicate via the API.
+**Inference Status:** The Gemini LLM API call did not return a response.
+* **Provider Diagnostic:** ${errorDetail || 'Google Generative AI service could not be reached.'}${explanation}
 
 ---
 
-### Core Components of Modern APIs
-
-1. **Endpoints (URLs):** Distinct paths representing resources (e.g., \`GET /api/v1/orders/1024\`).
-2. **HTTP Verbs:**
-   * **\`GET\`**: Retrieve data.
-   * **\`POST\`**: Create a new resource or submit data.
-   * **\`PUT\` / \`PATCH\`**: Update an existing record.
-   * **\`DELETE\`**: Remove a resource.
-3. **Headers:** Metadata providing authentication (\`Authorization: Bearer <token>\`), content type (\`application/json\`), and rate-limiting information.
-4. **Payload (Body):** The data sent with the request or returned in the response (typically JSON).
-5. **Status Codes:** Standardized responses indicating success (\`200 OK\`, \`201 Created\`), client errors (\`400 Bad Request\`, \`401 Unauthorized\`, \`404 Not Found\`), or server errors (\`500 Internal Error\`).
-
----
-
-### Real-World Examples
-
-* **Payment Processing:** E-commerce stores use the Stripe or PayPal API to securely charge credit cards without handling sensitive card numbers.
-* **Weather Applications:** Apps query meteorology APIs to fetch live weather forecasts.
-* **Social Authentication:** "Sign in with Google" or "Sign in with GitHub" calls OAuth APIs to authenticate users securely.
-* **RAG & Vector Pipelines:** Your frontend interacts with this backend via the \`/api/rag/query\` API to retrieve semantic embeddings and LLM responses.`;
-  }
-
-  // Knowledge base for C# / .NET reflection
-  if (q.includes('reflection') && (q.includes('c#') || q.includes('.net') || q.includes('csharp'))) {
-    return `### What is Reflection in C#?
-
-**Reflection** in C# and .NET is a powerful feature provided by the \`System.Reflection\` namespace that allows code to inspect assembly metadata, discover types, dynamically instantiate objects, and invoke methods at runtime.
-
----
-
-### Core Concepts & Classes
-
-* **\`Type\` / \`typeof()\`:** The primary entry point for reflection. Represents type declarations (classes, interfaces, structs, enums, delegates).
-* **\`Assembly\`:** Represents a loaded .NET assembly. Allows iterating over all exported types and modules.
-* **\`MethodInfo\` & \`PropertyInfo\`:** Provides access to member metadata, parameter lists, return types, and dynamic invocation.
-* **\`Activator.CreateInstance()\`:** Creates an instance of a type dynamically at runtime without static compile-time references.
-* **\`CustomAttributeData\`:** Inspects attributes applied to classes, properties, or methods.
-
----
-
-### C# Code Example
-
-\`\`\`csharp
-using System;
-using System.Reflection;
-
-public class Employee
-{
-    public string Name { get; set; } = "Taylor";
-    public void DisplayRole() => Console.WriteLine($"Role: Software Engineer");
+### How to Enable Dynamic Live Responses:
+1. Generate an active Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey).
+2. Ensure **"Generative Language API"** is enabled in your Google Cloud Console without restrictive IP or service blocks.
+3. Enter your active key in the **AI Key Settings** dialog in the app or configure \`GEMINI_API_KEY\` in your environment.`;
 }
 
-class Program
-{
-    static void Main()
-    {
-        // 1. Get Type metadata
-        Type type = typeof(Employee);
-        Console.WriteLine($"Type Name: {type.FullName}");
+// API Key Validation Endpoint
+app.post(['/api/gemini/validate-key', '/api/v1/gemini/validate-key'], async (req: Request, res: Response) => {
+  const { apiKey } = req.body;
+  if (!apiKey || typeof apiKey !== 'string' || apiKey.trim().length === 0) {
+    return res.status(400).json({ valid: false, error: 'API key is required' });
+  }
 
-        // 2. Inspect properties
-        foreach (PropertyInfo prop in type.GetProperties())
-        {
-            Console.WriteLine($"Property: {prop.Name} ({prop.PropertyType.Name})");
-        }
+  const trimmedKey = apiKey.trim();
+  const { ai } = getAiClient(trimmedKey);
+  if (!ai) {
+    return res.status(400).json({ valid: false, error: 'Could not initialize GoogleGenAI client with the provided key.' });
+  }
 
-        // 3. Dynamically instantiate and call a method
-        object instance = Activator.CreateInstance(type)!;
-        MethodInfo method = type.GetMethod("DisplayRole")!;
-        method.Invoke(instance, null);
+  for (const model of CANDIDATE_LLM_MODELS) {
+    try {
+      const testResp = await ai.models.generateContent({
+        model,
+        contents: 'Hi'
+      });
+      if (testResp.text) {
+        return res.json({ valid: true, modelUsed: model, message: 'Gemini API key is active and successfully authenticated!' });
+      }
+    } catch (err: any) {
+      const errorMsg = err?.message || String(err);
+      const isBlocked = errorMsg.includes('ACCESS_TOKEN_TYPE_UNSUPPORTED') || errorMsg.includes('API_KEY_SERVICE_BLOCKED') || err?.status === 401;
+      if (isBlocked) {
+        return res.json({
+          valid: false,
+          error: errorMsg,
+          reason: 'API_KEY_BLOCKED_OR_UNSUPPORTED',
+          message: 'This key was rejected by Google (401 ACCESS_TOKEN_TYPE_UNSUPPORTED / API_KEY_SERVICE_BLOCKED). Please generate a fresh key in a new project at https://aistudio.google.com/apikey.'
+        });
+      }
     }
-}
-\`\`\`
-
----
-
-### Key Use Cases in Modern Software
-
-* **Dependency Injection (DI):** Frameworks like ASP.NET Core DI scan assemblies to register and resolve dependencies automatically.
-* **Serialization & Deserialization:** Libraries like \`System.Text.Json\` and \`Newtonsoft.Json\` inspect object properties to serialize into JSON.
-* **Object-Relational Mapping (ORMs):** Entity Framework Core maps database columns to class properties using reflection and attributes.
-* **Unit Testing & Mocking:** Test frameworks (xUnit, NUnit, Moq) use reflection to discover test fixtures and mock interfaces.
-* **Plugin Architectures:** Loading external DLL files from a folder dynamically at runtime.
-
----
-
-### Advantages vs. Trade-offs
-
-* **Advantages:** Unmatched flexibility, allows building generic libraries and dynamic tools, and enables runtime extensibility.
-* **Trade-offs:** Performance overhead compared to static calls (can be optimized using Expression Trees or source generators), and lack of compile-time type safety.`;
   }
 
-  // General programming or technical questions
-  return `### Direct Explanation: "${question}"
-
-In software engineering and modern architecture:
-
-* **Definition & Core Purpose:** Addressing **"${question}"** involves understanding the fundamental interfaces, contracts, and interaction patterns between systems.
-* **Architecture Best Practices:**
-  * **Separation of Concerns:** Keep business logic decoupled from transport and delivery mechanisms.
-  * **Observability & Error Handling:** Implement structured logging, metrics, and health checks across service boundaries.
-  * **Security First:** Enforce authentication, rate limiting, and input validation on all inputs.
-* **Document Grounding Tip:** Upload documents (PDF, CSV, TXT, Word DOCX) in the **Upload Documents** tab to enable vector-indexed retrieval with citations!`;
-}
+  return res.json({
+    valid: false,
+    error: 'All candidate models failed to authenticate with this key.'
+  });
+});
 
 // Step 6, 7, 8: RAG Query Endpoint
 app.post(['/api/rag/query', '/api/v1/rag/query'], async (req: Request, res: Response) => {
@@ -387,7 +345,8 @@ app.post(['/api/rag/query', '/api/v1/rag/query'], async (req: Request, res: Resp
     minSimilarityScore = 0.55,
     topK = 4,
     departmentFilter,
-    userRoles = ['Public']
+    userRoles = ['Public'],
+    apiKey: requestApiKey
   } = req.body;
 
   if (!question || typeof question !== 'string') {
@@ -456,23 +415,24 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
     promptToSend = question;
   }
 
-  const generated = await callGeminiWithFallback({
-    contents: promptToSend,
-    config: {
-      systemInstruction,
-      temperature: contextFound ? 0.2 : 0.7,
-    }
-  });
+  const generated = await callGeminiWithFallback(
+    {
+      contents: promptToSend,
+      config: {
+        systemInstruction,
+        temperature: contextFound ? 0.2 : 0.7,
+      }
+    },
+    requestApiKey
+  );
 
   if (generated) {
     answerText = generated;
+  } else if (contextFound && relevantChunks.length > 0) {
+    const top = relevantChunks[0];
+    answerText = `Based on retrieved document [Doc: ${top.documentTitle} #${top.chunkIndex}], here is the relevant excerpt:\n\n${top.content}`;
   } else {
-    answerText = generateThoroughAnswer(question, contextFound, relevantChunks);
-  }
-
-  // Ensure answer is never empty
-  if (!answerText || answerText.trim().length === 0) {
-    answerText = generateThoroughAnswer(question, contextFound, relevantChunks);
+    answerText = formatDirectLlmFallbackResponse(question, lastLlmErrorDetails);
   }
 
   const llmInferenceTimeMs = Date.now() - llmStart;
@@ -525,6 +485,9 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
     }
   } else {
     warnings.push('Requirement #7 Fallback Triggered: No vector chunks passed similarity threshold; question routed directly to LLM.');
+    if (lastLlmErrorDetails) {
+      warnings.push(`LLM Provider Notice: ${lastLlmErrorDetails}`);
+    }
   }
 
   const validationTimeMs = Date.now() - valStart;

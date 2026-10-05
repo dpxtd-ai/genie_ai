@@ -27,7 +27,8 @@ import {
   Cpu,
   Layers,
   HelpCircle,
-  Database
+  Database,
+  Key
 } from 'lucide-react';
 
 // Configure marked for GitHub-Flavored Markdown
@@ -129,6 +130,48 @@ export default function App() {
 
   // Client-side Vector Chunks for GitHub Pages / Static hosting
   const [clientChunks, setClientChunks] = useState<ClientChunk[]>([]);
+
+  // Custom Gemini API Key State
+  const [customApiKey, setCustomApiKey] = useState<string>(() => localStorage.getItem('gemini_custom_key') || '');
+  const [showKeyModal, setShowKeyModal] = useState(false);
+  const [keyInput, setKeyInput] = useState(customApiKey);
+  const [testingKey, setTestingKey] = useState(false);
+  const [testResult, setTestResult] = useState<{ success?: boolean; message?: string } | null>(null);
+
+  const handleTestKey = async () => {
+    if (!keyInput.trim()) {
+      setTestResult({ success: false, message: 'Please enter an API key to test.' });
+      return;
+    }
+    setTestingKey(true);
+    setTestResult(null);
+    try {
+      const res = await fetch('/api/gemini/validate-key', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ apiKey: keyInput.trim() })
+      });
+      const data = await res.json();
+      if (data.valid) {
+        setTestResult({
+          success: true,
+          message: `Authentication succeeded! Model "${data.modelUsed}" responded successfully.`
+        });
+      } else {
+        setTestResult({
+          success: false,
+          message: data.message || data.error || 'Key authentication failed.'
+        });
+      }
+    } catch {
+      setTestResult({
+        success: false,
+        message: 'Could not connect to validation endpoint. Please ensure backend server is running.'
+      });
+    } finally {
+      setTestingKey(false);
+    }
+  };
 
   useEffect(() => {
     fetchDocuments();
@@ -484,116 +527,6 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
     setUploadMessage({ text: 'Cleaned all vector store data. Ready for fresh deployment.' });
   };
 
-  // Client Knowledge Generator for Direct LLM Queries
-  const getClientKnowledgeAnswer = (question: string): string => {
-    const q = question.toLowerCase();
-    if (q.includes('reflection') && (q.includes('c#') || q.includes('.net') || q.includes('csharp'))) {
-      return `### What is Reflection in C#?
-
-**Reflection** in C# and .NET is a mechanism in the \`System.Reflection\` namespace that allows code to inspect assembly metadata, discover types, dynamically instantiate objects, and invoke methods at runtime.
-
----
-
-### Core Concepts & Classes
-
-* **\`Type\` / \`typeof()\`:** The primary entry point for reflection. Represents type declarations (classes, interfaces, structs, enums, delegates).
-* **\`Assembly\`:** Represents a loaded .NET assembly. Allows iterating over all exported types and modules.
-* **\`MethodInfo\` & \`PropertyInfo\`:** Provides access to member metadata, parameter lists, return types, and dynamic invocation.
-* **\`Activator.CreateInstance()\`:** Creates an instance of a type dynamically at runtime without static compile-time references.
-* **\`CustomAttributeData\`:** Inspects attributes applied to classes, properties, or methods.
-
----
-
-### C# Code Example
-
-\`\`\`csharp
-using System;
-using System.Reflection;
-
-public class Employee
-{
-    public string Name { get; set; } = "Taylor";
-    public void DisplayRole() => Console.WriteLine($"Role: Software Engineer");
-}
-
-class Program
-{
-    static void Main()
-    {
-        // 1. Get Type metadata
-        Type type = typeof(Employee);
-        Console.WriteLine($"Type Name: {type.FullName}");
-
-        // 2. Inspect properties
-        foreach (PropertyInfo prop in type.GetProperties())
-        {
-            Console.WriteLine($"Property: {prop.Name} ({prop.PropertyType.Name})");
-        }
-
-        // 3. Dynamically instantiate and call a method
-        object instance = Activator.CreateInstance(type)!;
-        MethodInfo method = type.GetMethod("DisplayRole")!;
-        method.Invoke(instance, null);
-    }
-}
-\`\`\`
-
----
-
-### Key Use Cases in Modern Software
-
-* **Dependency Injection (DI):** Frameworks like ASP.NET Core DI scan assemblies to register and resolve dependencies automatically.
-* **Serialization & Deserialization:** Libraries like \`System.Text.Json\` and \`Newtonsoft.Json\` inspect object properties to serialize into JSON.
-* **Object-Relational Mapping (ORMs):** Entity Framework Core maps database columns to class properties using reflection and attributes.
-* **Unit Testing & Mocking:** Test frameworks (xUnit, NUnit, Moq) use reflection to discover test fixtures and mock interfaces.
-
----
-
-### Advantages vs. Trade-offs
-
-* **Advantages:** High runtime flexibility, ability to build generic libraries, and dynamic extensibility.
-* **Trade-offs:** Performance overhead compared to static calls (can be optimized using Expression Trees or source generators), and lack of compile-time type safety.`;
-    }
-
-    if (q.includes('api') && (q.includes('what is') || q.includes('define') || q.includes('how') || q.includes('explain') || q === 'what is api?')) {
-      return `### What is an API?
-
-An **API** (**Application Programming Interface**) is a software intermediary that allows **two different applications to communicate and exchange data with each other**. It acts as a messenger that delivers your request to a provider and returns the response back to you.
-
----
-
-### The Restaurant Analogy
-
-* **You (Client):** Sitting at a table ordering food.
-* **The Kitchen (Server/Database):** The backend system that prepares your request.
-* **The Waiter (API):** Takes your order from the table to the kitchen, tells the system what you need, and brings the response back to you. You never need to enter the kitchen or know internal implementation details; you simply communicate via the API.
-
----
-
-### Core Components of Modern APIs
-
-1. **Endpoints (URLs):** Distinct paths representing resources (e.g., \`GET /api/v1/orders/1024\`).
-2. **HTTP Verbs:** \`GET\` (retrieve), \`POST\` (create), \`PUT\` / \`PATCH\` (update), \`DELETE\` (remove).
-3. **Headers:** Metadata providing authentication (\`Authorization: Bearer <token>\`) and payload format (\`Content-Type: application/json\`).
-4. **Payload (Body):** The data sent with the request or returned in the response (typically JSON).
-5. **Status Codes:** Standard indicators (\`200 OK\`, \`201 Created\`, \`400 Bad Request\`, \`401 Unauthorized\`, \`404 Not Found\`, \`500 Error\`).
-
----
-
-### Real-World Examples
-
-* **Payment Processing:** E-commerce stores use Stripe or PayPal APIs to securely charge cards without storing card numbers.
-* **Weather Applications:** Apps query meteorology APIs to fetch live weather forecasts.
-* **Social Authentication:** "Sign in with Google" or "Sign in with GitHub" calls OAuth APIs to authenticate users securely.
-* **RAG Pipeline:** The frontend interacts with the backend via \`/api/rag/query\` to retrieve vector embeddings and LLM responses.`;
-    }
-
-    return `### Direct Explanation: "${question}"
-
-* **Direct Answer:** Regarding **"${question}"**, in modern software development and engineering, addressing this question involves adhering to modular separation of concerns, robust validation, and performance optimization.
-* **Document Grounding Tip:** Upload documents (PDF, CSV, TXT, Word DOCX) in the **Upload Documents** tab to enable vector-indexed retrieval with citations!`;
-  };
-
   // Option 2: AI Chat Query Execution
   const handleSendChat = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
@@ -620,7 +553,8 @@ An **API** (**Application Programming Interface**) is a software intermediary th
           question: questionText,
           minSimilarityScore: 0.50,
           topK: 4,
-          userRoles: ['Public', 'InternalEmployee', 'ConfidentialAdmin']
+          userRoles: ['Public', 'InternalEmployee', 'ConfidentialAdmin'],
+          apiKey: customApiKey || undefined
         })
       });
 
@@ -670,7 +604,7 @@ An **API** (**Application Programming Interface**) is a software intermediary th
     if (contextFound && bestChunk) {
       answerText = `Based on [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}], here is the relevant guidance:\n\n${bestChunk.content}\n\n*(Retrieved via Client-Side Vector Engine with ${(maxMatch * 100).toFixed(0)}% keyword match)*`;
     } else {
-      answerText = getClientKnowledgeAnswer(questionText);
+      answerText = `### AI Service Notice (Requirement #7)\n\nNo relevant vector documents were found matching **"${questionText}"**.\n\n* **Live LLM Inference:** In client-only static hosting mode, live AI calls require connecting to the backend API or supplying an active Gemini API key in **AI Key Settings**.\n* **Document Grounding:** Upload documents in the **Upload Documents** tab to index them into vector storage and enable grounded responses with verified citations.`;
     }
 
     setChatMessages((prev) => [
@@ -760,6 +694,23 @@ An **API** (**Application Programming Interface**) is a software intermediary th
               className={`p-2 rounded-xl text-xs transition-colors border ${isDark ? 'bg-slate-900 hover:bg-slate-800 text-amber-400 border-slate-800' : 'bg-white hover:bg-slate-100 text-indigo-600 border-slate-200 shadow-xs'}`}
               title={isDark ? 'Switch to Light Mode' : 'Switch to Dark Mode'}>
               {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+            </button>
+
+            {/* AI Key Configuration Button */}
+            <button
+              onClick={() => {
+                setKeyInput(customApiKey);
+                setShowKeyModal(true);
+              }}
+              className={`px-2.5 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 transition-colors border ${
+                customApiKey
+                  ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20'
+                  : isDark ? 'bg-slate-900 hover:bg-slate-800 text-slate-300 border-slate-800' : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200 shadow-xs'
+              }`}
+              title="Configure Gemini API Key">
+              <Key className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">AI Key</span>
+              {customApiKey && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />}
             </button>
 
             {/* Code Explorer / Export */}
@@ -1325,6 +1276,125 @@ An **API** (**Application Programming Interface**) is a software intermediary th
                   </div>
                 )}
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* AI Key Configuration Modal */}
+      {showKeyModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+          <div className={`w-full max-w-lg rounded-2xl border p-6 shadow-2xl flex flex-col gap-4 ${isDark ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200 text-slate-900'}`}>
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800/20">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-indigo-600/10 text-indigo-500 flex items-center justify-center font-bold">
+                  <Key className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm">Gemini API Key Settings</h3>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">Enable real-time dynamic AI generation for any question</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowKeyModal(false)}
+                className="text-slate-400 hover:text-slate-200 text-sm font-semibold p-1">
+                ✕
+              </button>
+            </div>
+
+            <div className="text-xs text-slate-500 dark:text-slate-400 space-y-2">
+              <p>
+                When vector search finds no matching documents, the pipeline routes your question directly to the Gemini LLM.
+              </p>
+              <p>
+                If your environment key is blocked or restricted by Google Cloud, you can enter an active key here. It will be stored locally in your browser.
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-semibold text-slate-300">
+                Gemini API Key
+              </label>
+              <input
+                type="password"
+                placeholder="AIzaSy... or AQ..."
+                value={keyInput}
+                onChange={(e) => setKeyInput(e.target.value)}
+                className={`w-full px-3 py-2 text-xs font-mono rounded-xl border focus:outline-none focus:ring-2 focus:ring-indigo-500 ${
+                  isDark ? 'bg-slate-950 border-slate-800 text-white' : 'bg-slate-50 border-slate-300 text-slate-900'
+                }`}
+              />
+              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                <span>Get a free key from <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="text-indigo-400 hover:underline">Google AI Studio</a></span>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={handleTestKey}
+                    disabled={testingKey}
+                    className="px-2.5 py-1 rounded-lg text-[11px] font-medium bg-slate-800 hover:bg-slate-700 text-indigo-300 border border-indigo-500/30 flex items-center gap-1 disabled:opacity-50">
+                    <Sparkles className="w-3 h-3" />
+                    <span>{testingKey ? 'Validating...' : 'Test Key'}</span>
+                  </button>
+                  {customApiKey && (
+                    <button
+                      onClick={() => {
+                        localStorage.removeItem('gemini_custom_key');
+                        setCustomApiKey('');
+                        setKeyInput('');
+                        setTestResult(null);
+                      }}
+                      className="text-red-400 hover:text-red-300">
+                      Clear Key
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {testResult && (
+                <div className={`p-3 rounded-xl border text-xs leading-relaxed ${
+                  testResult.success
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                    : 'bg-red-500/10 border-red-500/30 text-red-300'
+                }`}>
+                  <div className="font-semibold flex items-center gap-1.5 mb-1">
+                    {testResult.success ? <CheckCircle2 className="w-4 h-4 text-emerald-400" /> : <AlertCircle className="w-4 h-4 text-red-400" />}
+                    <span>{testResult.success ? 'Authentication Succeeded' : 'Key Validation Failed'}</span>
+                  </div>
+                  <p>{testResult.message}</p>
+                  {!testResult.success && (
+                    <div className="mt-2 pt-2 border-t border-red-500/20 text-[11px] text-slate-300 space-y-1">
+                      <p className="font-semibold text-red-200">How to resolve 401 ACCESS_TOKEN_TYPE_UNSUPPORTED / API_KEY_SERVICE_BLOCKED:</p>
+                      <ol className="list-decimal list-inside space-y-0.5 text-slate-300">
+                        <li>Visit <a href="https://aistudio.google.com/apikey" target="_blank" rel="noreferrer" className="text-indigo-400 underline">aistudio.google.com/apikey</a></li>
+                        <li>Click <strong>"Create API key"</strong> and choose <strong>"Create in new project"</strong></li>
+                        <li>Paste that newly generated key here and click <strong>Test Key</strong></li>
+                      </ol>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-800/20">
+              <button
+                onClick={() => setShowKeyModal(false)}
+                className={`px-3 py-1.5 rounded-xl text-xs font-medium ${isDark ? 'bg-slate-800 text-slate-300 hover:bg-slate-700' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}>
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  const trimmed = keyInput.trim();
+                  if (trimmed) {
+                    localStorage.setItem('gemini_custom_key', trimmed);
+                    setCustomApiKey(trimmed);
+                  } else {
+                    localStorage.removeItem('gemini_custom_key');
+                    setCustomApiKey('');
+                  }
+                  setShowKeyModal(false);
+                }}
+                className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-indigo-600 text-white hover:bg-indigo-500 shadow-md shadow-indigo-600/20">
+                Save Key
+              </button>
             </div>
           </div>
         </div>

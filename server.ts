@@ -65,6 +65,48 @@ interface StoredDoc {
 const documentsDatabase = new Map<string, StoredDoc>();
 const chunksDatabase = new Map<string, StoredChunk>();
 
+const DATA_DIR = path.resolve(process.cwd(), 'data');
+const STORE_FILE = path.join(DATA_DIR, 'vector_store.json');
+
+function persistVectorStoreToFile() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    const data = {
+      documents: Array.from(documentsDatabase.values()),
+      chunks: Array.from(chunksDatabase.values())
+    };
+    fs.writeFileSync(STORE_FILE, JSON.stringify(data, null, 2), 'utf-8');
+  } catch (err) {
+    console.warn('Failed to persist vector store to file:', err);
+  }
+}
+
+function loadVectorStoreFromFile() {
+  try {
+    if (fs.existsSync(STORE_FILE)) {
+      const content = fs.readFileSync(STORE_FILE, 'utf-8');
+      const data = JSON.parse(content);
+      if (Array.isArray(data.documents)) {
+        for (const doc of data.documents) {
+          documentsDatabase.set(doc.id, doc);
+        }
+      }
+      if (Array.isArray(data.chunks)) {
+        for (const chunk of data.chunks) {
+          chunksDatabase.set(chunk.id, chunk);
+        }
+      }
+      console.log(`Loaded ${documentsDatabase.size} documents and ${chunksDatabase.size} chunks from local file store.`);
+    }
+  } catch (err) {
+    console.warn('Failed to load vector store from file:', err);
+  }
+}
+
+loadVectorStoreFromFile();
+
 // Helper: Cosine Similarity
 function cosineSimilarity(a: number[], b: number[]): number {
   if (a.length !== b.length || a.length === 0) return 0;
@@ -198,6 +240,7 @@ function createChunks(cleanedText: string, docId: string, title: string, departm
 app.post(['/api/documents/clear-all', '/api/v1/documents/clear-all'], (req: Request, res: Response) => {
   documentsDatabase.clear();
   chunksDatabase.clear();
+  persistVectorStoreToFile();
   res.json({ success: true, message: 'All documents and vector embeddings have been cleared.' });
 });
 
@@ -635,6 +678,7 @@ app.post(['/api/documents/upload-file', '/api/v1/documents/upload-file'], async 
     };
 
     documentsDatabase.set(docId, docEntry);
+    persistVectorStoreToFile();
 
     res.json({
       success: true,
@@ -738,6 +782,7 @@ app.delete(['/api/documents/:id', '/api/v1/documents/:id'], (req: Request, res: 
   for (const [chunkId, chunk] of chunksDatabase.entries()) {
     if (chunk.documentId === id) chunksDatabase.delete(chunkId);
   }
+  persistVectorStoreToFile();
   res.status(204).send();
 });
 

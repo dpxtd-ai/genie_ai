@@ -28,7 +28,8 @@ import {
   Layers,
   HelpCircle,
   Database,
-  Key
+  Key,
+  HardDrive
 } from 'lucide-react';
 
 // Configure marked for GitHub-Flavored Markdown
@@ -101,12 +102,20 @@ export default function App() {
   const [activeOption, setActiveOption] = useState<'upload' | 'chat' | 'docs'>('chat');
   const [showCodeModal, setShowCodeModal] = useState(false);
 
-  // Option 1: Upload Documents State
-  const [documents, setDocuments] = useState<StoredDoc[]>([]);
+  // Option 1: Upload Documents State (persisted to localStorage for offline/GitHub Pages/DB disconnects)
+  const [documents, setDocuments] = useState<StoredDoc[]>(() => {
+    try {
+      const saved = localStorage.getItem('genie_stored_documents');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
   const [isUploading, setIsUploading] = useState(false);
   const [uploadMessage, setUploadMessage] = useState<{ text: string; isError?: boolean } | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const jsonInputRef = useRef<HTMLInputElement>(null);
 
   // Option 2: AI Chat State
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
@@ -128,8 +137,32 @@ export default function App() {
   const [copiedCode, setCopiedCode] = useState(false);
   const [copiedBash, setCopiedBash] = useState<string | null>(null);
 
-  // Client-side Vector Chunks for GitHub Pages / Static hosting
-  const [clientChunks, setClientChunks] = useState<ClientChunk[]>([]);
+  // Client-side Vector Chunks for GitHub Pages / Static hosting (persisted to localStorage)
+  const [clientChunks, setClientChunks] = useState<ClientChunk[]>(() => {
+    try {
+      const saved = localStorage.getItem('genie_stored_chunks');
+      return saved ? JSON.parse(saved) : [];
+    } catch {
+      return [];
+    }
+  });
+
+  // Sync state changes to localStorage
+  useEffect(() => {
+    try {
+      localStorage.setItem('genie_stored_documents', JSON.stringify(documents));
+    } catch (e) {
+      console.warn('Could not persist documents to localStorage:', e);
+    }
+  }, [documents]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('genie_stored_chunks', JSON.stringify(clientChunks));
+    } catch (e) {
+      console.warn('Could not persist chunks to localStorage:', e);
+    }
+  }, [clientChunks]);
 
   // Custom Gemini API Key State
   const [customApiKey, setCustomApiKey] = useState<string>(() => localStorage.getItem('gemini_custom_key') || '');
@@ -280,12 +313,33 @@ export default function App() {
       const res = await fetch('/api/documents');
       if (res.ok) {
         const data = await res.json();
-        if (Array.isArray(data)) {
+        if (Array.isArray(data) && data.length > 0) {
           setDocuments(data);
+          return;
         }
       }
     } catch {
       // Static hosting / GitHub Pages: rely on client-side state
+    }
+
+    // If backend did not return documents or is not connected, retain from localStorage!
+    try {
+      const savedDocs = localStorage.getItem('genie_stored_documents');
+      if (savedDocs) {
+        const parsed = JSON.parse(savedDocs);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setDocuments(parsed);
+        }
+      }
+      const savedChunks = localStorage.getItem('genie_stored_chunks');
+      if (savedChunks) {
+        const parsed = JSON.parse(savedChunks);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          setClientChunks(parsed);
+        }
+      }
+    } catch (err) {
+      console.warn('Error reading from localStorage:', err);
     }
   };
 
@@ -574,9 +628,19 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
           chunksCount: newChunks.length
         };
 
-        setDocuments(prev => [newDoc, ...prev]);
+        const updatedChunks = [...newChunks, ...clientChunks];
+        const updatedDocs = [newDoc, ...documents];
+        setClientChunks(updatedChunks);
+        setDocuments(updatedDocs);
+        try {
+          localStorage.setItem('genie_stored_chunks', JSON.stringify(updatedChunks));
+          localStorage.setItem('genie_stored_documents', JSON.stringify(updatedDocs));
+        } catch (e) {
+          console.warn('LocalStorage save error:', e);
+        }
+
         setUploadMessage({
-          text: `Successfully ingested "${file.name}"! Created ${newChunks.length} vector chunks.`
+          text: `Successfully ingested "${file.name}"! Created ${newChunks.length} vector chunks. Saved to local persistent file store.`
         });
       } catch (err: any) {
         setUploadMessage({ text: err.message || 'Error processing file', isError: true });
@@ -594,8 +658,14 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
     } catch {
       // Ignore network errors on static hosting
     }
-    setDocuments(prev => prev.filter(d => d.id !== id));
-    setClientChunks(prev => prev.filter(c => c.docId !== id));
+    const updatedDocs = documents.filter(d => d.id !== id);
+    const updatedChunks = clientChunks.filter(c => c.docId !== id);
+    setDocuments(updatedDocs);
+    setClientChunks(updatedChunks);
+    try {
+      localStorage.setItem('genie_stored_documents', JSON.stringify(updatedDocs));
+      localStorage.setItem('genie_stored_chunks', JSON.stringify(updatedChunks));
+    } catch {}
   };
 
   const handleClearAllDocs = async () => {
@@ -607,7 +677,52 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
     }
     setDocuments([]);
     setClientChunks([]);
+    try {
+      localStorage.removeItem('genie_stored_documents');
+      localStorage.removeItem('genie_stored_chunks');
+    } catch {}
     setUploadMessage({ text: 'Cleaned all vector store data. Ready for fresh deployment.' });
+  };
+
+  // Export & Backup Stored Vector Knowledge Base to a JSON file
+  const handleExportStore = () => {
+    const data = {
+      app: 'Genie AI Vector Store',
+      exportedAt: new Date().toISOString(),
+      documents,
+      chunks: clientChunks
+    };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `genie_vector_store_${new Date().toISOString().slice(0, 10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // Import / Restore Stored Vector Knowledge Base from a JSON file
+  const handleImportStore = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const text = event.target?.result as string;
+        const parsed = JSON.parse(text);
+        if (Array.isArray(parsed.documents) && Array.isArray(parsed.chunks)) {
+          setDocuments(parsed.documents);
+          setClientChunks(parsed.chunks);
+          localStorage.setItem('genie_stored_documents', JSON.stringify(parsed.documents));
+          localStorage.setItem('genie_stored_chunks', JSON.stringify(parsed.chunks));
+          setUploadMessage({ text: `Successfully loaded ${parsed.documents.length} documents and ${parsed.chunks.length} chunks from backup file!` });
+        }
+      } catch (err: any) {
+        setUploadMessage({ text: 'Invalid vector store JSON file.', isError: true });
+      }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
   };
 
   // Option 2: AI Chat Query Execution
@@ -628,6 +743,7 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
     setChatMessages((prev) => [...prev, userMsg]);
     setIsAiThinking(true);
 
+    // Step 1: Try full-stack vector DB endpoint first
     try {
       const res = await fetch('/api/rag/query', {
         method: 'POST',
@@ -660,57 +776,85 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
         return;
       }
     } catch {
-      // In-browser client fallback
+      // Backend / Vector DB connection not available (e.g. GitHub Pages or DB down)
     }
 
-    // Static GitHub Pages / In-Browser Fallback Search
-    const words = questionText.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-    let bestChunk: any = null;
+    // Step 2: Look at stored files & chunks from local persistent store
+    const query = questionText.toLowerCase();
+    const queryWords = query
+      .replace(/[^\w\s]/g, ' ')
+      .split(/\s+/)
+      .filter(w => w.length > 2);
+
+    let bestChunk: ClientChunk | null = null;
     let maxMatch = 0;
 
     for (const chunk of clientChunks) {
       const contentLower = chunk.content.toLowerCase();
+      const titleLower = chunk.title.toLowerCase();
+
       let matches = 0;
-      for (const w of words) {
-        if (contentLower.includes(w)) matches++;
+      for (const w of queryWords) {
+        if (contentLower.includes(w) || titleLower.includes(w)) {
+          matches++;
+        }
       }
-      const score = words.length > 0 ? matches / words.length : 0;
-      if (score > maxMatch) {
-        maxMatch = score;
+
+      // Token overlap score
+      const overlapScore = queryWords.length > 0 ? (matches / queryWords.length) : 0;
+      
+      // Title match boost
+      let titleBoost = 0;
+      if (queryWords.some(w => titleLower.includes(w))) {
+        titleBoost = 0.35;
+      }
+
+      // Exact substring boost
+      const exactBoost = contentLower.includes(query) ? 0.30 : 0;
+      const totalScore = overlapScore + titleBoost + exactBoost;
+
+      if (totalScore > maxMatch) {
+        maxMatch = totalScore;
         bestChunk = chunk;
       }
     }
 
-    const contextFound = maxMatch >= 0.35 && bestChunk !== null;
+    // Step 3: Check if vector / file context matched
+    const contextFound = maxMatch >= 0.25 && bestChunk !== null;
     let answerText = '';
 
-    // If running on static host (GitHub Pages) and user has configured a custom key:
-    if (customApiKey) {
-      try {
-        let systemPrompt = '';
-        let promptToSend = '';
+    if (contextFound && bestChunk) {
+      // VECTOR / FILE CONTEXT MATCHED:
+      if (customApiKey) {
+        // Synthesize dynamic answer using Gemini LLM with retrieved file context
+        try {
+          const systemPrompt = `You are Genie, a trusted enterprise AI assistant. Answer the user question accurately and truthfully based strictly on the retrieved document context below. Always cite your source using [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}].`;
+          const promptToSend = `=== RETRIEVED CONTEXT (From Stored File: "${bestChunk.title}") ===\n[Doc: ${bestChunk.title} #${bestChunk.chunkIndex}]\n${bestChunk.content}\n\n=== USER QUESTION ===\n${questionText}\n\nPlease provide a clear, helpful response citing [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}].`;
 
-        if (contextFound && bestChunk) {
-          systemPrompt = `You are Genie, a trusted enterprise AI assistant. Answer the user question accurately and truthfully based strictly on the retrieved document context below. When stating facts from a chunk, cite your source using [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}].`;
-          promptToSend = `=== RETRIEVED CONTEXT ===\n[Doc: ${bestChunk.title} #${bestChunk.chunkIndex}]\n${bestChunk.content}\n\n=== USER QUESTION ===\n${questionText}`;
-        } else {
-          // Requirement #7: If no context found with vector search then same input text send to llm.
-          systemPrompt = `You are Genie, an expert AI software engineer and knowledgeable assistant. Answer the user's question clearly, thoroughly, and practically using structured markdown headings (###), bold terms, and code snippets where appropriate.`;
-          promptToSend = questionText;
+          const llmResponse = await callGeminiDirectlyFromBrowser(customApiKey, promptToSend, systemPrompt);
+          answerText = llmResponse || `Based on [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}], here is the relevant guidance:\n\n${bestChunk.content}`;
+        } catch {
+          answerText = `Based on [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}], here is the relevant guidance:\n\n${bestChunk.content}\n\n*(Retrieved from stored vector file with ${(Math.min(maxMatch, 1) * 100).toFixed(0)}% match)*`;
         }
-
-        const llmResponse = await callGeminiDirectlyFromBrowser(customApiKey, promptToSend, systemPrompt);
-        if (llmResponse) {
-          answerText = llmResponse;
-        }
-      } catch (geminiErr: any) {
-        answerText = `### Direct Gemini Request Notice\n\nThe query was routed to Gemini LLM directly from your browser, but returned an error:\n* **Reason:** ${geminiErr.message || String(geminiErr)}\n\nPlease click **AI Key** in the top bar to test or update your key.`;
+      } else {
+        answerText = `Based on [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}], here is the relevant guidance:\n\n${bestChunk.content}\n\n*(Retrieved from stored vector file with ${(Math.min(maxMatch, 1) * 100).toFixed(0)}% match)*`;
       }
     } else {
-      if (contextFound && bestChunk) {
-        answerText = `Based on [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}], here is the relevant guidance:\n\n${bestChunk.content}\n\n*(Retrieved via Client-Side Vector Engine with ${(maxMatch * 100).toFixed(0)}% keyword match)*`;
+      // "IF VECTOR NOT MATCHED THEN GO FOR LLM CURRENT FLOW" (Requirement #7):
+      if (customApiKey) {
+        try {
+          const systemPrompt = `You are Genie, an expert AI software engineer and knowledgeable assistant. 
+The user is asking a question directly without custom vector documents in the knowledge base.
+Provide a comprehensive, accurate, practical, and well-structured answer to the user's question.
+Use clean markdown with headings (###), bold key terms, bullet points, and code snippets where appropriate.`;
+
+          const llmResponse = await callGeminiDirectlyFromBrowser(customApiKey, questionText, systemPrompt);
+          answerText = llmResponse;
+        } catch (geminiErr: any) {
+          answerText = `### Direct Gemini Request Notice (Requirement #7)\n\nNo relevant vector documents were found matching **"${questionText}"**, so the query was routed directly to Gemini LLM.\n\n* **Status:** ${geminiErr.message || String(geminiErr)}\n\nPlease click **AI Key** in the top bar to verify or update your key.`;
+        }
       } else {
-        answerText = `### AI Service Notice (Requirement #7)\n\nNo relevant vector documents were found matching **"${questionText}"**.\n\n* **Live LLM Inference:** You are running on GitHub Pages (static host). Click the **AI Key** button in the top navigation bar and enter your Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey) to enable real-time dynamic AI generation for any question.\n* **Document Grounding:** Upload documents in the **Upload Documents** tab to index them into vector storage.`;
+        answerText = `### AI Service Notice (Requirement #7)\n\nNo relevant vector documents were found in your stored files matching **"${questionText}"**.\n\n* **Live LLM Inference:** You are running in client-side static mode (e.g. GitHub Pages). To enable live AI responses for any question, click the **AI Key** button in the top navigation bar and enter your Gemini API key from [Google AI Studio](https://aistudio.google.com/apikey).\n* **Document Grounding:** Upload documents in the **Upload Documents** tab to index them into vector storage.`;
       }
     }
 
@@ -722,7 +866,19 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
         text: answerText,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         contextFound,
-        executionMode: contextFound ? 'ClientSideRAG' : 'DirectLlmFallback'
+        executionMode: contextFound ? 'ClientSideRAG' : 'DirectLlmFallback',
+        retrievedCount: contextFound && bestChunk ? 1 : 0,
+        sources: contextFound && bestChunk ? [bestChunk.title] : [],
+        citations: contextFound && bestChunk ? [
+          {
+            citationLabel: `Doc: ${bestChunk.title} #${bestChunk.chunkIndex}`,
+            documentTitle: bestChunk.title,
+            chunkIndex: bestChunk.chunkIndex,
+            similarityScore: Math.min(Math.round(maxMatch * 100) / 100, 1),
+            department: bestChunk.department || 'General',
+            snippet: bestChunk.content.slice(0, 150) + '...'
+          }
+        ] : []
       }
     ]);
     setIsAiThinking(false);
@@ -852,14 +1008,39 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
                   </p>
                 </div>
 
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <input
+                    type="file"
+                    ref={jsonInputRef}
+                    onChange={handleImportStore}
+                    accept=".json"
+                    className="hidden"
+                  />
+                  <button
+                    onClick={() => jsonInputRef.current?.click()}
+                    className={`px-3 py-1.5 border rounded-lg text-xs flex items-center gap-1.5 transition-colors ${isDark ? 'bg-slate-800 hover:bg-slate-700 text-slate-300 border-slate-700' : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'}`}
+                    title="Import previously saved vector store JSON backup">
+                    <HardDrive className="w-3.5 h-3.5 text-indigo-400" />
+                    <span>Import Store</span>
+                  </button>
+
                   {documents.length > 0 && (
-                    <button
-                      onClick={handleClearAllDocs}
-                      className={`px-3 py-1.5 border rounded-lg text-xs flex items-center gap-1.5 transition-colors ${isDark ? 'bg-rose-950/60 hover:bg-rose-900/60 text-rose-300 border-rose-800/80' : 'bg-rose-50 hover:bg-rose-100 text-rose-700 border-rose-200'}`}>
-                      <Trash2 className="w-3.5 h-3.5 text-rose-500" />
-                      <span>Clean All Data</span>
-                    </button>
+                    <>
+                      <button
+                        onClick={handleExportStore}
+                        className={`px-3 py-1.5 border rounded-lg text-xs flex items-center gap-1.5 transition-colors ${isDark ? 'bg-slate-800 hover:bg-slate-700 text-indigo-300 border-indigo-500/30' : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200'}`}
+                        title="Download backup JSON file of all ingested vector documents">
+                        <Download className="w-3.5 h-3.5 text-indigo-500" />
+                        <span>Export Store</span>
+                      </button>
+
+                      <button
+                        onClick={handleClearAllDocs}
+                        className={`px-3 py-1.5 border rounded-lg text-xs flex items-center gap-1.5 transition-colors ${isDark ? 'bg-rose-950/60 hover:bg-rose-900/60 text-rose-300 border-rose-800/80' : 'bg-rose-50 hover:bg-rose-100 text-rose-700 border-rose-200'}`}>
+                        <Trash2 className="w-3.5 h-3.5 text-rose-500" />
+                        <span>Clean All Data</span>
+                      </button>
+                    </>
                   )}
                 </div>
               </div>

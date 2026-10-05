@@ -128,14 +128,7 @@ export default function App() {
   const [copiedBash, setCopiedBash] = useState<string | null>(null);
 
   // Client-side Vector Chunks for GitHub Pages / Static hosting
-  const [clientChunks, setClientChunks] = useState<Array<{
-    id: string;
-    docId: string;
-    title: string;
-    content: string;
-    department: string;
-    chunkIndex: number;
-  }>>([]);
+  const [clientChunks, setClientChunks] = useState<ClientChunk[]>([]);
 
   useEffect(() => {
     fetchDocuments();
@@ -561,8 +554,45 @@ class Program
 * **Advantages:** High runtime flexibility, ability to build generic libraries, and dynamic extensibility.
 * **Trade-offs:** Performance overhead compared to static calls (can be optimized using Expression Trees or source generators), and lack of compile-time type safety.`;
     }
-   return `### Answer to: "${question}"`;
- };
+
+    if (q.includes('api') && (q.includes('what is') || q.includes('define') || q.includes('how') || q.includes('explain') || q === 'what is api?')) {
+      return `### What is an API?
+
+An **API** (**Application Programming Interface**) is a software intermediary that allows **two different applications to communicate and exchange data with each other**. It acts as a messenger that delivers your request to a provider and returns the response back to you.
+
+---
+
+### The Restaurant Analogy
+
+* **You (Client):** Sitting at a table ordering food.
+* **The Kitchen (Server/Database):** The backend system that prepares your request.
+* **The Waiter (API):** Takes your order from the table to the kitchen, tells the system what you need, and brings the response back to you. You never need to enter the kitchen or know internal implementation details; you simply communicate via the API.
+
+---
+
+### Core Components of Modern APIs
+
+1. **Endpoints (URLs):** Distinct paths representing resources (e.g., \`GET /api/v1/orders/1024\`).
+2. **HTTP Verbs:** \`GET\` (retrieve), \`POST\` (create), \`PUT\` / \`PATCH\` (update), \`DELETE\` (remove).
+3. **Headers:** Metadata providing authentication (\`Authorization: Bearer <token>\`) and payload format (\`Content-Type: application/json\`).
+4. **Payload (Body):** The data sent with the request or returned in the response (typically JSON).
+5. **Status Codes:** Standard indicators (\`200 OK\`, \`201 Created\`, \`400 Bad Request\`, \`401 Unauthorized\`, \`404 Not Found\`, \`500 Error\`).
+
+---
+
+### Real-World Examples
+
+* **Payment Processing:** E-commerce stores use Stripe or PayPal APIs to securely charge cards without storing card numbers.
+* **Weather Applications:** Apps query meteorology APIs to fetch live weather forecasts.
+* **Social Authentication:** "Sign in with Google" or "Sign in with GitHub" calls OAuth APIs to authenticate users securely.
+* **RAG Pipeline:** The frontend interacts with the backend via \`/api/rag/query\` to retrieve vector embeddings and LLM responses.`;
+    }
+
+    return `### Direct Explanation: "${question}"
+
+* **Direct Answer:** Regarding **"${question}"**, in modern software development and engineering, addressing this question involves adhering to modular separation of concerns, robust validation, and performance optimization.
+* **Document Grounding Tip:** Upload documents (PDF, CSV, TXT, Word DOCX) in the **Upload Documents** tab to enable vector-indexed retrieval with citations!`;
+  };
 
   // Option 2: AI Chat Query Execution
   const handleSendChat = async (e?: React.FormEvent) => {

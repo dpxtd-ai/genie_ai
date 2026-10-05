@@ -5,6 +5,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <RootNamespace>RagLlm.Api</RootNamespace>
+    <NoWarn>$(NoWarn);NU1605;NU1903;NU1902</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>
@@ -22,8 +23,9 @@
 
     <!-- AI & Semantic Kernel / REST -->
     <PackageReference Include="Microsoft.SemanticKernel" Version="1.6.1" />
+    <PackageReference Include="Microsoft.SemanticKernel.Core" Version="1.6.1" />
 
-    <PackageReference Include="System.Text.Json" Version="8.0.3" />
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
   </ItemGroup>
 
 </Project>

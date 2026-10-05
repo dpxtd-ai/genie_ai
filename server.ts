@@ -120,6 +120,113 @@ function cosineSimilarity(a: number[], b: number[]): number {
   return denom > 1e-7 ? dot / denom : 0;
 }
 
+// Fuzzy matching for typo tolerance (e.g. "refleaction" vs "reflection")
+function levenshteinDist(s1: string, s2: string): number {
+  if (s1 === s2) return 0;
+  if (!s1.length) return s2.length;
+  if (!s2.length) return s1.length;
+  const v0 = new Int32Array(s2.length + 1);
+  const v1 = new Int32Array(s2.length + 1);
+  for (let i = 0; i <= s2.length; i++) v0[i] = i;
+  for (let i = 0; i < s1.length; i++) {
+    v1[0] = i + 1;
+    for (let j = 0; j < s2.length; j++) {
+      const cost = s1[i] === s2[j] ? 0 : 1;
+      v1[j + 1] = Math.min(v1[j] + 1, v0[j + 1] + 1, v0[j] + cost);
+    }
+    for (let j = 0; j <= s2.length; j++) v0[j] = v1[j];
+  }
+  return v1[s2.length];
+}
+
+function computeWordSimilarity(w1: string, w2: string): number {
+  if (w1 === w2) return 1.0;
+  if (w1.length < 3 || w2.length < 3) return w1 === w2 ? 1.0 : 0;
+  if (w1.startsWith(w2) || w2.startsWith(w1)) return 0.92;
+  if (w1.includes(w2) || w2.includes(w1)) return 0.88;
+  const dist = levenshteinDist(w1, w2);
+  const maxLen = Math.max(w1.length, w2.length);
+  if (dist <= 2 && maxLen >= 5) return 1 - (dist / maxLen);
+  if (dist === 1) return 0.85;
+  return 0;
+}
+
+const STOP_WORDS = new Set([
+  'what', 'is', 'are', 'was', 'were', 'the', 'a', 'an', 'in', 'on', 'at', 'by',
+  'for', 'with', 'about', 'against', 'between', 'into', 'through', 'during',
+  'before', 'after', 'above', 'below', 'to', 'from', 'up', 'down', 'of', 'off',
+  'over', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when',
+  'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most',
+  'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so',
+  'than', 'too', 'very', 'can', 'will', 'just', 'should', 'now', 'tell', 'me',
+  'give', 'explain', 'describe', 'define', 'please'
+]);
+
+function scoreChunkRelevance(
+  query: string,
+  chunk: { title?: string; documentTitle?: string; content: string }
+): number {
+  const normalizedQuery = query.toLowerCase();
+  const rawWords = normalizedQuery
+    .replace(/[^\w\s#+.]/g, ' ')
+    .split(/\s+/)
+    .map(w => w.trim())
+    .filter(w => w.length > 1);
+
+  const contentWords = rawWords.filter(w => !STOP_WORDS.has(w));
+  const queryTerms = contentWords.length > 0 ? contentWords : rawWords;
+
+  if (queryTerms.length === 0) return 0;
+
+  const title = (chunk.title || chunk.documentTitle || '').toLowerCase();
+  const contentLower = chunk.content.toLowerCase();
+  const chunkWords = (title + ' ' + contentLower)
+    .replace(/[^\w\s#+.]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 1);
+
+  let totalTermScore = 0;
+
+  for (const qTerm of queryTerms) {
+    let bestTermScore = 0;
+
+    if (contentLower.includes(qTerm)) {
+      bestTermScore = Math.max(bestTermScore, 1.0);
+    }
+    if (title.includes(qTerm)) {
+      bestTermScore = Math.max(bestTermScore, 1.2);
+    }
+
+    if (bestTermScore < 1.0) {
+      for (const cWord of chunkWords) {
+        const sim = computeWordSimilarity(qTerm, cWord);
+        if (sim >= 0.70) {
+          bestTermScore = Math.max(bestTermScore, sim);
+          if (title.includes(cWord)) {
+            bestTermScore += 0.25;
+          }
+          if (bestTermScore >= 1.0) break;
+        }
+      }
+    }
+
+    if (bestTermScore >= 0.65) {
+      totalTermScore += bestTermScore;
+    }
+  }
+
+  const coverage = totalTermScore / queryTerms.length;
+  let titleBonus = 0;
+  for (const qTerm of queryTerms) {
+    const titleSim = computeWordSimilarity(qTerm, title);
+    if (titleSim >= 0.75) {
+      titleBonus = Math.max(titleBonus, 0.40);
+    }
+  }
+
+  return Math.min(coverage + titleBonus, 1.0);
+}
+
 // Helper: Deterministic Local Vector Hashing (for offline or fallback)
 function generateDeterministicVector(text: string, dimensions = 768): number[] {
   const vector = new Array(dimensions).fill(0);
@@ -418,11 +525,14 @@ app.post(['/api/rag/query', '/api/v1/rag/query'], async (req: Request, res: Resp
 
     if (!isAllowed) continue;
 
-    const score = cosineSimilarity(queryEmbedding, chunk.embedding);
-    if (score >= minSimilarityScore) {
+    const cosineScore = cosineSimilarity(queryEmbedding, chunk.embedding);
+    const relevanceScore = scoreChunkRelevance(question, chunk);
+    const combinedScore = Math.max(cosineScore, relevanceScore);
+
+    if (combinedScore >= 0.25) {
       matchedChunks.push({
         ...chunk,
-        similarityScore: Math.round(score * 1000) / 1000
+        similarityScore: Math.round(combinedScore * 1000) / 1000
       });
     }
   }

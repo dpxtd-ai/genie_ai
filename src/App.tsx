@@ -95,6 +95,116 @@ interface ClientChunk {
   department: string;
 }
 
+// Levenshtein distance for fuzzy matching typos (e.g. "refleaction" vs "reflection")
+function levenshteinDist(s1: string, s2: string): number {
+  if (s1 === s2) return 0;
+  if (!s1.length) return s2.length;
+  if (!s2.length) return s1.length;
+  const v0 = new Int32Array(s2.length + 1);
+  const v1 = new Int32Array(s2.length + 1);
+  for (let i = 0; i <= s2.length; i++) v0[i] = i;
+  for (let i = 0; i < s1.length; i++) {
+    v1[0] = i + 1;
+    for (let j = 0; j < s2.length; j++) {
+      const cost = s1[i] === s2[j] ? 0 : 1;
+      v1[j + 1] = Math.min(v1[j] + 1, v0[j + 1] + 1, v0[j] + cost);
+    }
+    for (let j = 0; j <= s2.length; j++) v0[j] = v1[j];
+  }
+  return v1[s2.length];
+}
+
+function computeWordSimilarity(w1: string, w2: string): number {
+  if (w1 === w2) return 1.0;
+  if (w1.length < 3 || w2.length < 3) return w1 === w2 ? 1.0 : 0;
+  if (w1.startsWith(w2) || w2.startsWith(w1)) return 0.92;
+  if (w1.includes(w2) || w2.includes(w1)) return 0.88;
+  const dist = levenshteinDist(w1, w2);
+  const maxLen = Math.max(w1.length, w2.length);
+  if (dist <= 2 && maxLen >= 5) return 1 - (dist / maxLen);
+  if (dist === 1) return 0.85;
+  return 0;
+}
+
+const STOP_WORDS = new Set([
+  'what', 'is', 'are', 'was', 'were', 'the', 'a', 'an', 'in', 'on', 'at', 'by',
+  'for', 'with', 'about', 'against', 'between', 'into', 'through', 'during',
+  'before', 'after', 'above', 'below', 'to', 'from', 'up', 'down', 'of', 'off',
+  'over', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when',
+  'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most',
+  'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so',
+  'than', 'too', 'very', 'can', 'will', 'just', 'should', 'now', 'tell', 'me',
+  'give', 'explain', 'describe', 'define', 'please'
+]);
+
+function scoreChunkRelevance(
+  query: string,
+  chunk: { title?: string; content: string }
+): { score: number; matchedWords: string[] } {
+  const normalizedQuery = query.toLowerCase();
+  const rawWords = normalizedQuery
+    .replace(/[^\w\s#+.]/g, ' ')
+    .split(/\s+/)
+    .map(w => w.trim())
+    .filter(w => w.length > 1);
+
+  const contentWords = rawWords.filter(w => !STOP_WORDS.has(w));
+  const queryTerms = contentWords.length > 0 ? contentWords : rawWords;
+
+  if (queryTerms.length === 0) return { score: 0, matchedWords: [] };
+
+  const title = (chunk.title || '').toLowerCase();
+  const contentLower = chunk.content.toLowerCase();
+  const chunkWords = (title + ' ' + contentLower)
+    .replace(/[^\w\s#+.]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 1);
+
+  const matchedWords: string[] = [];
+  let totalTermScore = 0;
+
+  for (const qTerm of queryTerms) {
+    let bestTermScore = 0;
+
+    if (contentLower.includes(qTerm)) {
+      bestTermScore = Math.max(bestTermScore, 1.0);
+    }
+    if (title.includes(qTerm)) {
+      bestTermScore = Math.max(bestTermScore, 1.2);
+    }
+
+    if (bestTermScore < 1.0) {
+      for (const cWord of chunkWords) {
+        const sim = computeWordSimilarity(qTerm, cWord);
+        if (sim >= 0.70) {
+          bestTermScore = Math.max(bestTermScore, sim);
+          if (title.includes(cWord)) {
+            bestTermScore += 0.25;
+          }
+          if (bestTermScore >= 1.0) break;
+        }
+      }
+    }
+
+    if (bestTermScore >= 0.65) {
+      matchedWords.push(qTerm);
+      totalTermScore += bestTermScore;
+    }
+  }
+
+  const coverage = totalTermScore / queryTerms.length;
+  let titleBonus = 0;
+  for (const qTerm of queryTerms) {
+    const titleSim = computeWordSimilarity(qTerm, title);
+    if (titleSim >= 0.75) {
+      titleBonus = Math.max(titleBonus, 0.40);
+    }
+  }
+
+  const finalScore = Math.min(coverage + titleBonus, 1.0);
+  return { score: finalScore, matchedWords };
+}
+
 export default function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     return (localStorage.getItem('genie_theme') as 'dark' | 'light') || 'dark';
@@ -780,47 +890,19 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
     }
 
     // Step 2: Look at stored files & chunks from local persistent store
-    const query = questionText.toLowerCase();
-    const queryWords = query
-      .replace(/[^\w\s]/g, ' ')
-      .split(/\s+/)
-      .filter(w => w.length > 2);
-
     let bestChunk: ClientChunk | null = null;
     let maxMatch = 0;
 
     for (const chunk of clientChunks) {
-      const contentLower = chunk.content.toLowerCase();
-      const titleLower = chunk.title.toLowerCase();
-
-      let matches = 0;
-      for (const w of queryWords) {
-        if (contentLower.includes(w) || titleLower.includes(w)) {
-          matches++;
-        }
-      }
-
-      // Token overlap score
-      const overlapScore = queryWords.length > 0 ? (matches / queryWords.length) : 0;
-      
-      // Title match boost
-      let titleBoost = 0;
-      if (queryWords.some(w => titleLower.includes(w))) {
-        titleBoost = 0.35;
-      }
-
-      // Exact substring boost
-      const exactBoost = contentLower.includes(query) ? 0.30 : 0;
-      const totalScore = overlapScore + titleBoost + exactBoost;
-
-      if (totalScore > maxMatch) {
-        maxMatch = totalScore;
+      const { score } = scoreChunkRelevance(questionText, chunk);
+      if (score > maxMatch) {
+        maxMatch = score;
         bestChunk = chunk;
       }
     }
 
-    // Step 3: Check if vector / file context matched
-    const contextFound = maxMatch >= 0.25 && bestChunk !== null;
+    // Step 3: Check if vector / file context matched (Threshold >= 0.20 ensures robust match even with typos)
+    const contextFound = maxMatch >= 0.20 && bestChunk !== null;
     let answerText = '';
 
     if (contextFound && bestChunk) {

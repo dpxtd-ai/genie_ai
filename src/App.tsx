@@ -305,7 +305,11 @@ export default function App() {
               role: 'user',
               parts: [{ text: prompt }]
             }
-          ]
+          ],
+          generationConfig: {
+            temperature: 0.25,
+            maxOutputTokens: 4096
+          }
         };
         if (systemInstruction) {
           payload.systemInstruction = {
@@ -889,43 +893,99 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
       // Backend / Vector DB connection not available (e.g. GitHub Pages or DB down)
     }
 
-    // Step 2: Look at stored files & chunks from local persistent store
-    let bestChunk: ClientChunk | null = null;
-    let maxMatch = 0;
+    // Step 2: Score all stored files & chunks from local persistent store
+    const scoredChunks = clientChunks.map(chunk => {
+      const { score, matchedWords } = scoreChunkRelevance(questionText, chunk);
+      return { ...chunk, score, matchedWords };
+    });
 
-    for (const chunk of clientChunks) {
-      const { score } = scoreChunkRelevance(questionText, chunk);
-      if (score > maxMatch) {
-        maxMatch = score;
-        bestChunk = chunk;
-      }
-    }
+    const maxMatch = scoredChunks.reduce((max, c) => Math.max(max, c.score), 0);
 
-    // Step 3: Check if vector / file context matched (Threshold >= 0.20 ensures robust match even with typos)
-    const contextFound = maxMatch >= 0.20 && bestChunk !== null;
+    // Step 3: Check if vector / file context matched
+    const contextFound = maxMatch >= 0.20;
     let answerText = '';
 
-    if (contextFound && bestChunk) {
-      // VECTOR / FILE CONTEXT MATCHED:
+    if (contextFound) {
+      // Find documents with matched chunks
+      const matchedDocIds = new Set(scoredChunks.filter(c => c.score >= 0.20).map(c => c.docId));
+
+      // Retrieve all relevant chunks from the matched document(s), ordered logically by chunkIndex
+      const retrievedChunks = scoredChunks
+        .filter(c => c.score >= 0.15 || matchedDocIds.has(c.docId))
+        .sort((a, b) => {
+          if (a.docId === b.docId) return a.chunkIndex - b.chunkIndex;
+          return b.score - a.score;
+        })
+        .slice(0, 6);
+
+      const contextBlock = retrievedChunks
+        .map(c => `--- [Doc: ${c.title} #${c.chunkIndex}] (Relevance: ${(Math.min(c.score, 1) * 100).toFixed(0)}%) ---\n${c.content}`)
+        .join('\n\n');
+
       if (customApiKey) {
-        // Synthesize dynamic answer using Gemini LLM with retrieved file context
         try {
-          const systemPrompt = `You are Genie, a trusted enterprise AI assistant. Answer the user question accurately and truthfully based strictly on the retrieved document context below. Always cite your source using [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}].`;
-          const promptToSend = `=== RETRIEVED CONTEXT (From Stored File: "${bestChunk.title}") ===\n[Doc: ${bestChunk.title} #${bestChunk.chunkIndex}]\n${bestChunk.content}\n\n=== USER QUESTION ===\n${questionText}\n\nPlease provide a clear, helpful response citing [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}].`;
+          const systemPrompt = `You are Genie, a principal software engineer and enterprise AI architect.
+Your objective is to provide a complete, comprehensive, authoritative, and production-grade answer to the user's question.
+
+CRITICAL QUALITY STANDARDS:
+1. CONTEXT GROUNDING & CITATIONS:
+   - Ground your answer thoroughly in the provided document context chunks.
+   - Cite the sources inline with [Doc: <Title> #<Index>] when referencing concepts, classes, pros/cons, or statements from them.
+2. COMPLETENESS & DEPTH (NO SHALLOW OR TRUNCATED ANSWERS):
+   - When explaining technical concepts, provide an in-depth explanation covering what it is, core mechanics (e.g., how metadata and IL interact at runtime), key namespaces and classes (e.g., Type, MethodInfo, PropertyInfo, Activator), and practical code snippets.
+   - When asked for "Pros and Cons" or advantages/disadvantages, you MUST provide an exhaustive, high-detail breakdown of BOTH:
+     * Advantages: Detailed points explaining flexibility, dynamic discovery, automation, extensibility/plugins.
+     * Disadvantages: Detailed points explaining performance overhead, lack of compile-time type safety, security/encapsulation risks, and refactoring fragility.
+   - NEVER leave any section, bullet list, or heading empty, incomplete, or abruptly ended.
+3. STRUCTURE & CODE:
+   - Format with clear Markdown headings (###), bold terms, clean bullet points, and realistic C# code examples.
+   - Provide clean, professional developer documentation quality.`;
+
+          const promptToSend = `=== RETRIEVED KNOWLEDGE BASE CONTEXT ===
+${contextBlock}
+
+=== USER QUESTION ===
+${questionText}
+
+Please answer the user's question thoroughly and professionally according to the quality standards above, with citations to the retrieved chunks.`;
 
           const llmResponse = await callGeminiDirectlyFromBrowser(customApiKey, promptToSend, systemPrompt);
-          answerText = llmResponse || `Based on [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}], here is the relevant guidance:\n\n${bestChunk.content}`;
+          answerText = llmResponse || retrievedChunks.map(c => `### [Doc: ${c.title} #${c.chunkIndex}]\n\n${c.content}`).join('\n\n---\n\n');
         } catch {
-          answerText = `Based on [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}], here is the relevant guidance:\n\n${bestChunk.content}\n\n*(Retrieved from stored vector file with ${(Math.min(maxMatch, 1) * 100).toFixed(0)}% match)*`;
+          answerText = retrievedChunks.map(c => `### [Doc: ${c.title} #${c.chunkIndex}]\n\n${c.content}`).join('\n\n---\n\n');
         }
       } else {
-        answerText = `Based on [Doc: ${bestChunk.title} #${bestChunk.chunkIndex}], here is the relevant guidance:\n\n${bestChunk.content}\n\n*(Retrieved from stored vector file with ${(Math.min(maxMatch, 1) * 100).toFixed(0)}% match)*`;
+        answerText = retrievedChunks.map(c => `### [Doc: ${c.title} #${c.chunkIndex}]\n\n${c.content}`).join('\n\n---\n\n');
       }
+
+      setChatMessages((prev) => [
+        ...prev,
+        {
+          id: (Date.now() + 1).toString(),
+          sender: 'assistant',
+          text: answerText,
+          timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+          contextFound: true,
+          executionMode: 'ClientSideRAG',
+          retrievedCount: retrievedChunks.length,
+          sources: Array.from(new Set(retrievedChunks.map(c => c.title))),
+          citations: retrievedChunks.map(c => ({
+            citationLabel: `Doc: ${c.title} #${c.chunkIndex}`,
+            documentTitle: c.title,
+            chunkIndex: c.chunkIndex,
+            similarityScore: Math.min(Math.round(c.score * 100) / 100, 1),
+            department: c.department || 'General',
+            snippet: c.content.slice(0, 150) + '...'
+          }))
+        }
+      ]);
+      setIsAiThinking(false);
+      return;
     } else {
       // "IF VECTOR NOT MATCHED THEN GO FOR LLM CURRENT FLOW" (Requirement #7):
       if (customApiKey) {
         try {
-          const systemPrompt = `You are Genie, an expert AI software engineer and knowledgeable assistant. 
+          const systemPrompt = `You are Genie, a principal software engineer and knowledgeable assistant. 
 The user is asking a question directly without custom vector documents in the knowledge base.
 Provide a comprehensive, accurate, practical, and well-structured answer to the user's question.
 Use clean markdown with headings (###), bold key terms, bullet points, and code snippets where appropriate.`;
@@ -947,20 +1007,11 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
         sender: 'assistant',
         text: answerText,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        contextFound,
-        executionMode: contextFound ? 'ClientSideRAG' : 'DirectLlmFallback',
-        retrievedCount: contextFound && bestChunk ? 1 : 0,
-        sources: contextFound && bestChunk ? [bestChunk.title] : [],
-        citations: contextFound && bestChunk ? [
-          {
-            citationLabel: `Doc: ${bestChunk.title} #${bestChunk.chunkIndex}`,
-            documentTitle: bestChunk.title,
-            chunkIndex: bestChunk.chunkIndex,
-            similarityScore: Math.min(Math.round(maxMatch * 100) / 100, 1),
-            department: bestChunk.department || 'General',
-            snippet: bestChunk.content.slice(0, 150) + '...'
-          }
-        ] : []
+        contextFound: false,
+        executionMode: 'DirectLlmFallback',
+        retrievedCount: 0,
+        sources: [],
+        citations: []
       }
     ]);
     setIsAiThinking(false);

@@ -538,7 +538,28 @@ app.post(['/api/rag/query', '/api/v1/rag/query'], async (req: Request, res: Resp
   }
 
   matchedChunks.sort((a, b) => b.similarityScore - a.similarityScore);
-  const relevantChunks = matchedChunks.slice(0, topK);
+
+  // Collect relevant chunks, prioritizing matched documents and ordering by chunkIndex
+  const matchedDocIds = new Set(matchedChunks.slice(0, 3).map(c => c.documentId));
+  const expandedChunks: Array<StoredChunk & { similarityScore: number }> = [];
+
+  for (const chunk of chunksDatabase.values()) {
+    if (matchedDocIds.has(chunk.documentId)) {
+      const matchItem = matchedChunks.find(m => m.id === chunk.id);
+      expandedChunks.push({
+        ...chunk,
+        similarityScore: matchItem ? matchItem.similarityScore : 0.75
+      });
+    }
+  }
+
+  // Sort by document and chunkIndex so the AI reads coherent full document context
+  expandedChunks.sort((a, b) => {
+    if (a.documentId === b.documentId) return a.chunkIndex - b.chunkIndex;
+    return b.similarityScore - a.similarityScore;
+  });
+
+  const relevantChunks = (expandedChunks.length > 0 ? expandedChunks : matchedChunks).slice(0, 6);
   const vectorSearchTimeMs = Date.now() - searchStart;
 
   // Step 7: LLM – Send only relevant context to the LLM.
@@ -553,15 +574,33 @@ app.post(['/api/rag/query', '/api/v1/rag/query'], async (req: Request, res: Resp
   let systemInstruction = '';
 
   if (contextFound) {
-    systemInstruction = `You are Genie, a trusted enterprise AI assistant. Answer the user question accurately and truthfully based strictly on the retrieved context chunks below.
-When stating facts from a chunk, cite your source using [Doc: <Title> #<Index>].
+    systemInstruction = `You are Genie, a principal software engineer and enterprise AI architect.
+Your objective is to provide a complete, comprehensive, authoritative, and production-grade answer to the user's question.
 
-=== RETRIEVED CONTEXT (Only Relevant Chunks) ===
-${relevantChunks.map(c => `--- [Doc: ${c.documentTitle} #${c.chunkIndex}] (Similarity: ${c.similarityScore}, Dept: ${c.department}) ---\n${c.content}\n`).join('\n')}`;
-    promptToSend = `User Question: ${question}\n\nPlease provide a clear, concise, and well-structured answer citing the documents above.`;
+CRITICAL QUALITY STANDARDS:
+1. CONTEXT GROUNDING & CITATIONS:
+   - Ground your answer thoroughly in the provided document context chunks.
+   - Cite the sources inline with [Doc: <Title> #<Index>] when referencing concepts, classes, pros/cons, or statements from them.
+2. COMPLETENESS & DEPTH (NO SHALLOW OR TRUNCATED ANSWERS):
+   - When explaining technical concepts, provide an in-depth explanation covering what it is, core mechanics (e.g., how metadata and IL interact at runtime), key namespaces and classes (e.g., Type, MethodInfo, PropertyInfo, Activator), and practical code snippets.
+   - When asked for "Pros and Cons" or advantages/disadvantages, you MUST provide an exhaustive, high-detail breakdown of BOTH:
+     * Advantages: Detailed points explaining flexibility, dynamic discovery, automation, extensibility/plugins.
+     * Disadvantages: Detailed points explaining performance overhead, lack of compile-time type safety, security/encapsulation risks, and refactoring fragility.
+   - NEVER leave any section, bullet list, or heading empty, incomplete, or abruptly ended.
+3. STRUCTURE & CODE:
+   - Format with clear Markdown headings (###), bold terms, clean bullet points, and realistic C# code examples.
+   - Provide clean, professional developer documentation quality.`;
+
+    promptToSend = `=== RETRIEVED KNOWLEDGE BASE CONTEXT ===
+${relevantChunks.map(c => `--- [Doc: ${c.documentTitle} #${c.chunkIndex}] (Similarity: ${c.similarityScore}, Dept: ${c.department}) ---\n${c.content}\n`).join('\n')}
+
+=== USER QUESTION ===
+${question}
+
+Please answer the user's question thoroughly and professionally according to the quality standards above, with citations to the retrieved chunks.`;
   } else {
     // REQUIREMENT #7: If no context found with vector search then same input text send to llm.
-    systemInstruction = `You are Genie, an expert AI software engineer and knowledgeable assistant. 
+    systemInstruction = `You are Genie, a principal software engineer and knowledgeable assistant. 
 The user is asking a question directly without custom vector documents in the knowledge base.
 Provide a comprehensive, accurate, practical, and well-structured answer to the user's question.
 Use clean markdown with headings (###), bold key terms, bullet points, and code snippets where appropriate.`;

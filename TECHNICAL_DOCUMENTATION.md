@@ -186,3 +186,56 @@ psql -h localhost -U postgres -d ragdb -c "CREATE EXTENSION IF NOT EXISTS vector
 #### Q5: "Why did you build both React and Angular/.NET versions?"
 * **Answer**:
   Enterprise environments frequently use ASP.NET Core and Angular for internal portals. Providing clean implementations in both frameworks demonstrates full-stack versatility, dependency injection patterns in C#, and reactive component state management in modern web architectures.
+
+#### Q6: "How do you handle typos (e.g. 'refleaction' vs 'reflection') and keyword mismatches in vector search?"
+* **Answer**:
+  1. **Dense Vector Semantics**: Pretrained embedding models map minor variations and synonyms into nearby vector space.
+  2. **Hybrid Fuzzy Relevance Engine**: In addition to vector cosine distance, our engine implements token extraction, stop-word elimination, and **Levenshtein edit-distance similarity** (`computeWordSimilarity`). A query word like `refleaction` matches `reflection` with $>90\%$ confidence.
+  3. **Title Boost**: When any extracted content term fuzzy-matches a document's title or metadata, the candidate chunk receives a weighted score bonus, preventing accidental zero-score fallbacks when the user's intent is clearly focused on an ingested document.
+
+#### Q7: "Why did retrieving only a single chunk cause incomplete answers (like truncated Pros and Cons), and how did multi-chunk assembly fix it?"
+* **Answer**:
+  1. **Chunk Boundary Fragmentation**: When a document (e.g., `Reflection.txt`) is chunked into 4 slices, Chunk #0 contains the definition, Chunk #1 contains class APIs, Chunk #2 contains advantages, and Chunk #3 contains disadvantages and performance caveats.
+  2. **Single-Chunk Limitation**: If the retriever only returns the single top-1 chunk (`bestChunk`), the LLM receives only 25% of the document. When asked to "include pros and cons", it finds advantages in Chunk #2 but runs out of context before disadvantages, leading to empty headings or truncated output.
+  3. **Multi-Chunk Document Assembly**: When a document scores above the relevance threshold, the engine retrieves **all top-matching chunks across the document** (up to 6 chunks, ordered sequentially by `chunkIndex`). The LLM receives the coherent, full context, allowing it to provide an exhaustive, production-grade answer with complete advantages, disadvantages, and code examples.
+
+#### Q8: "PostgreSQL pgvector vs Specialized Vector Databases (Pinecone, Weaviate, Milvus, Qdrant): How do you decide?"
+* **Answer**:
+  * **When to choose PostgreSQL `pgvector`**:
+    1. **Operational Simplicity**: You already run Postgres for relational data. No extra operational cluster, billing, or security perimeter required.
+    2. **ACID Transactions**: Vector embeddings can be inserted, updated, or deleted within the exact same database transaction as the document metadata and user permissions.
+    3. **Relational Joins**: Allows native SQL joins (`JOIN users ON ... JOIN permissions ON ...`) to filter vectors by user roles or tenant IDs in a single query execution plan.
+  * **When to choose a dedicated Vector DB (Pinecone/Milvus/Qdrant)**:
+    1. **Scale**: Datasets exceeding 50–100 million vectors where dedicated distributed vector clustering and memory-mapped HNSW graphs are needed.
+    2. **High QPS**: Workloads requiring thousands of vector queries per second across massive multi-tenant spaces.
+
+#### Q9: "What is the difference between Dense Retrieval and Sparse Retrieval, and what is Hybrid Search?"
+* **Answer**:
+  * **Dense Retrieval (Embeddings)**: Represents text as continuous, high-dimensional floating-point vectors (e.g. 768 dimensions). Excels at semantic meaning, paraphrasing, and cross-lingual understanding, but can struggle with exact serial numbers, product codes, or rare acronyms.
+  * **Sparse Retrieval (BM25 / TF-IDF)**: Matches exact keywords based on inverted indexes and term frequency. Excels at exact keywords, code identifiers, and rare terms, but fails on synonyms or conceptual paraphrasing.
+  * **Hybrid Search with Reciprocal Rank Fusion (RRF)**: Executes both dense vector search and sparse BM25 search in parallel, then combines their ranks using RRF:
+    $$\text{RRF Score}(d) = \sum_{m \in M} \frac{1}{k + r_m(d)}$$
+    This provides the best of both worlds: conceptual comprehension plus exact keyword precision.
+
+#### Q10: "How does the system maintain offline availability and persist data across browser refreshes?"
+* **Answer**:
+  1. **Dual Storage Tier**: When deployed on full-stack infrastructure, files and embeddings are mirrored to `./data/vector_store.json` so state survives container restarts.
+  2. **In-Browser Client Storage**: For static deployments (such as GitHub Pages where no persistent backend server exists), all ingested documents and chunks are serialized to `localStorage` (`genie_stored_chunks` and `genie_stored_documents`).
+  3. **Portable Backup/Restore**: The UI provides **Export Store (JSON)** and **Import Store** utilities, enabling users to export their vector knowledge base as a backup file and restore it across any browser or environment.
+
+#### Q11: "How do you evaluate and monitor RAG pipeline quality in production (The RAG Triad)?"
+* **Answer**:
+  We evaluate RAG pipelines using the **RAG Triad** framework (standardized by Ragas and TruLens):
+  1. **Context Relevance**: Measures whether retrieved chunks are relevant to the user query (detects retriever noise).
+  2. **Groundedness / Faithfulness**: Measures whether every factual claim in the generated response can be traced back to the retrieved context (detects hallucinations).
+  3. **Answer Relevance**: Measures whether the generated answer directly addresses the user's question without wandering off-topic.
+  In production, we track citation density, user feedback (thumbs up/down), and fallback trigger rates.
+
+#### Q12: "What techniques do you apply to minimize latency in a production enterprise RAG pipeline?"
+* **Answer**:
+  1. **Token Streaming**: Stream LLM response tokens directly to the UI via Server-Sent Events (SSE) so Time-to-First-Token (TTFT) is $<400\text{ms}$.
+  2. **Vector Index Optimization**: Use HNSW index with tuned `ef_search` to keep nearest-neighbor retrieval under $10\text{ms}$.
+  3. **Embedding Caching**: Cache query embeddings in Redis for recurring questions to bypass embedding API calls.
+  4. **Pre-Filtering**: Execute RBAC and department filters *before* computing vector distances, drastically reducing the candidate search space.
+  5. **Model Tiering**: Use fast, cost-effective models like `gemini-3.8-flash` for the generation step rather than high-latency heavy models.
+

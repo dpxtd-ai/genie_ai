@@ -29,8 +29,13 @@ import {
   HelpCircle,
   Database,
   Key,
-  HardDrive
+  HardDrive,
+  Search,
+  Tag,
+  ChevronDown,
+  ChevronUp
 } from 'lucide-react';
+import { INTERVIEW_QUESTIONS } from './interviewData';
 
 // Configure marked for GitHub-Flavored Markdown
 marked.setOptions({
@@ -246,6 +251,11 @@ export default function App() {
   const [selectedFile, setSelectedFile] = useState<CodeFileItem | null>(null);
   const [copiedCode, setCopiedCode] = useState(false);
   const [copiedBash, setCopiedBash] = useState<string | null>(null);
+
+  // Interview Guide State
+  const [interviewSearch, setInterviewSearch] = useState('');
+  const [interviewCategory, setInterviewCategory] = useState<string>('all');
+  const [expandedQuestionId, setExpandedQuestionId] = useState<string | null>(null);
 
   // Client-side Vector Chunks for GitHub Pages / Static hosting (persisted to localStorage)
   const [clientChunks, setClientChunks] = useState<ClientChunk[]>(() => {
@@ -1579,44 +1589,186 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
 
             {/* Deep-Dive Interview Questions & Model Answers */}
             <div className={`border rounded-2xl p-6 ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm'}`}>
-              <h3 className="text-sm font-bold flex items-center gap-2 mb-4">
-                <HelpCircle className="w-4 h-4 text-indigo-500" />
-                <span>Top Interview Questions &amp; Model Answers</span>
-              </h3>
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-4">
+                <div>
+                  <h3 className="text-sm font-bold flex items-center gap-2">
+                    <HelpCircle className="w-4 h-4 text-indigo-500" />
+                    <span>Top 12 Production RAG Interview Questions &amp; Model Answers</span>
+                  </h3>
+                  <p className={`text-xs mt-0.5 ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                    Master key architectural tradeoffs, chunking math, fuzzy retrieval, RBAC security, and scaling patterns.
+                  </p>
+                </div>
+                <div className="text-xs font-mono px-2.5 py-1 rounded-lg border bg-indigo-500/10 text-indigo-400 border-indigo-500/20 w-fit">
+                  {INTERVIEW_QUESTIONS.length} Questions Loaded
+                </div>
+              </div>
 
-              <div className="space-y-4 text-xs">
-                <div className={`p-4 rounded-xl border ${isDark ? 'bg-slate-950/60 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
-                  <div className="font-bold text-sm text-indigo-500 mb-1">
-                    Q1: How do you prevent hallucinations in your RAG pipeline?
-                  </div>
-                  <div className={`leading-relaxed space-y-1.5 ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
-                    <p><strong>1. Strict Prompt Grounding:</strong> When context chunks match, the LLM prompt enforces zero outside assumptions and requires bracket citations [Doc: Title #Idx].</p>
-                    <p><strong>2. Deterministic Cosine Thresholding (0.50):</strong> Low-relevance noise is never injected into the context window.</p>
-                    <p><strong>3. Low Temperature (0.2):</strong> RAG queries run at 0.2 temperature for high factual accuracy and low creativity.</p>
-                    <p><strong>4. Dual-Path Fallback:</strong> If no documents match, the pipeline openly routes directly to the LLM instead of making up a fake document.</p>
-                  </div>
+              {/* Search & Category Filter */}
+              <div className="space-y-3 mb-5">
+                <div className="relative">
+                  <Search className="w-4 h-4 absolute left-3 top-3 text-slate-400" />
+                  <input
+                    type="text"
+                    value={interviewSearch}
+                    onChange={(e) => setInterviewSearch(e.target.value)}
+                    placeholder="Search questions by topic, keyword, or tag (e.g., 'overlap', 'pgvector', 'typo', 'RBAC', 'latency')..."
+                    className={`w-full pl-9 pr-9 py-2.5 text-xs rounded-xl border focus:outline-none focus:ring-2 focus:ring-indigo-500 transition-colors ${
+                      isDark ? 'bg-slate-950 border-slate-800 text-slate-100 placeholder-slate-500' : 'bg-slate-50 border-slate-300 text-slate-900 placeholder-slate-400'
+                    }`}
+                  />
+                  {interviewSearch && (
+                    <button
+                      onClick={() => setInterviewSearch('')}
+                      className="absolute right-3 top-2.5 text-xs text-slate-400 hover:text-slate-200">
+                      ✕
+                    </button>
+                  )}
                 </div>
 
-                <div className={`p-4 rounded-xl border ${isDark ? 'bg-slate-950/60 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
-                  <div className="font-bold text-sm text-indigo-500 mb-1">
-                    Q2: Why use a 20% chunk overlap? What failure does it prevent?
-                  </div>
-                  <div className={`leading-relaxed ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
-                    If an essential sentence or rule (e.g., "Severance pay is strictly granted only after 12 months") is split between the end of Chunk 1 and the start of Chunk 2 without overlap, both chunks lose semantic coherence. The embedding of each partial sentence scores poorly in similarity search, causing retrieval to miss the answer. A 20% sliding window (~70-80 tokens) guarantees that boundary phrases exist together in at least one chunk.
-                  </div>
+                {/* Category Pills */}
+                <div className="flex items-center gap-1.5 overflow-x-auto pb-1 text-xs">
+                  {[
+                    { id: 'all', label: 'All Questions', count: INTERVIEW_QUESTIONS.length },
+                    { id: 'architecture', label: 'Architecture & Guardrails', count: INTERVIEW_QUESTIONS.filter(q => q.category === 'architecture').length },
+                    { id: 'chunking', label: 'Chunking & Ingestion', count: INTERVIEW_QUESTIONS.filter(q => q.category === 'chunking').length },
+                    { id: 'retrieval', label: 'Retrieval & Search', count: INTERVIEW_QUESTIONS.filter(q => q.category === 'retrieval').length },
+                    { id: 'scaling', label: 'Scale & Performance', count: INTERVIEW_QUESTIONS.filter(q => q.category === 'scaling').length },
+                    { id: 'production', label: 'Production & DevOps', count: INTERVIEW_QUESTIONS.filter(q => q.category === 'production').length }
+                  ].map((cat) => (
+                    <button
+                      key={cat.id}
+                      onClick={() => setInterviewCategory(cat.id)}
+                      className={`px-3 py-1 rounded-lg transition-all text-[11px] whitespace-nowrap flex items-center gap-1.5 border ${
+                        interviewCategory === cat.id
+                          ? 'bg-indigo-600 text-white font-semibold border-indigo-600 shadow-xs'
+                          : isDark
+                          ? 'bg-slate-950 hover:bg-slate-800 text-slate-300 border-slate-800'
+                          : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200'
+                      }`}>
+                      <span>{cat.label}</span>
+                      <span className={`text-[10px] px-1 rounded ${interviewCategory === cat.id ? 'bg-indigo-700 text-white' : isDark ? 'bg-slate-800 text-slate-400' : 'bg-slate-200 text-slate-600'}`}>
+                        {cat.count}
+                      </span>
+                    </button>
+                  ))}
                 </div>
+              </div>
 
-                <div className={`p-4 rounded-xl border ${isDark ? 'bg-slate-950/60 border-slate-800/80' : 'bg-slate-50 border-slate-200'}`}>
-                  <div className="font-bold text-sm text-indigo-500 mb-1">
-                    Q3: How would you scale this vector database to 10 million documents?
+              {/* Questions List */}
+              <div className="space-y-4">
+                {INTERVIEW_QUESTIONS.filter((q) => {
+                  const matchesCat = interviewCategory === 'all' || q.category === interviewCategory;
+                  const query = interviewSearch.toLowerCase().trim();
+                  if (!query) return matchesCat;
+                  const matchesSearch =
+                    q.question.toLowerCase().includes(query) ||
+                    q.summary.toLowerCase().includes(query) ||
+                    q.tags.some(t => t.toLowerCase().includes(query)) ||
+                    q.answerBullets.some(b => b.title.toLowerCase().includes(query) || b.text.toLowerCase().includes(query));
+                  return matchesCat && matchesSearch;
+                }).map((q) => {
+                  const isExpanded = expandedQuestionId === q.id || !interviewSearch;
+                  return (
+                    <div
+                      key={q.id}
+                      className={`p-4 rounded-xl border transition-all ${
+                        isDark ? 'bg-slate-950/70 border-slate-800 hover:border-slate-700' : 'bg-slate-50 border-slate-200 hover:border-slate-300'
+                      }`}>
+                      {/* Top Header */}
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-2">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="px-2 py-0.5 rounded-md font-mono text-[10px] font-bold bg-indigo-600 text-white">
+                            Q{q.number}
+                          </span>
+                          <span className={`px-2 py-0.5 rounded text-[10px] font-medium border ${
+                            isDark ? 'bg-slate-900 border-slate-800 text-slate-300' : 'bg-white border-slate-200 text-slate-600'
+                          }`}>
+                            {q.categoryLabel}
+                          </span>
+                        </div>
+
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => {
+                              setUserInput(q.question);
+                              setActiveOption('chat');
+                            }}
+                            className={`text-[10px] px-2 py-0.5 rounded border transition-colors flex items-center gap-1 ${
+                              isDark ? 'bg-indigo-950/50 hover:bg-indigo-900 text-indigo-300 border-indigo-800' : 'bg-indigo-50 hover:bg-indigo-100 text-indigo-700 border-indigo-200'
+                            }`}
+                            title="Test this question in AI Chat">
+                            <Send className="w-2.5 h-2.5" />
+                            <span>Ask in AI Chat</span>
+                          </button>
+
+                          <button
+                            onClick={() => setExpandedQuestionId(expandedQuestionId === q.id ? null : q.id)}
+                            className="text-slate-400 hover:text-slate-200 p-1">
+                            {isExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                          </button>
+                        </div>
+                      </div>
+
+                      {/* Question Heading */}
+                      <h4 className={`font-bold text-sm mb-1.5 ${isDark ? 'text-indigo-400' : 'text-indigo-600'}`}>
+                        {q.question}
+                      </h4>
+
+                      {/* Executive Summary */}
+                      <p className={`text-xs italic mb-3 ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
+                        &ldquo;{q.summary}&rdquo;
+                      </p>
+
+                      {/* Answer Breakdown */}
+                      {isExpanded && (
+                        <div className="space-y-2 border-t pt-3 mt-2 border-slate-800/40 text-xs">
+                          {q.answerBullets.map((bullet, idx) => (
+                            <div key={idx} className="flex items-start gap-2">
+                              <span className="w-1.5 h-1.5 rounded-full bg-indigo-500 mt-1.5 shrink-0" />
+                              <div className={isDark ? 'text-slate-300' : 'text-slate-700'}>
+                                <strong className={`font-semibold ${isDark ? 'text-slate-100' : 'text-slate-900'}`}>
+                                  {bullet.title}:
+                                </strong>{' '}
+                                {bullet.text}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Tag Chips */}
+                      <div className="flex items-center gap-1.5 mt-3 pt-2 border-t border-slate-800/30 flex-wrap">
+                        <Tag className="w-3 h-3 text-slate-500 shrink-0" />
+                        {q.tags.map((t, idx) => (
+                          <span
+                            key={idx}
+                            onClick={() => setInterviewSearch(t)}
+                            className={`text-[10px] font-mono px-1.5 py-0.5 rounded cursor-pointer transition-colors ${
+                              isDark ? 'bg-slate-900 hover:bg-slate-800 text-slate-400' : 'bg-slate-200 hover:bg-slate-300 text-slate-600'
+                            }`}>
+                            #{t}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  );
+                })}
+
+                {INTERVIEW_QUESTIONS.filter((q) => {
+                  const matchesCat = interviewCategory === 'all' || q.category === interviewCategory;
+                  const query = interviewSearch.toLowerCase().trim();
+                  if (!query) return matchesCat;
+                  return matchesCat && (
+                    q.question.toLowerCase().includes(query) ||
+                    q.summary.toLowerCase().includes(query) ||
+                    q.tags.some(t => t.toLowerCase().includes(query))
+                  );
+                }).length === 0 && (
+                  <div className={`p-8 text-center text-xs rounded-xl border ${isDark ? 'border-slate-800 text-slate-500' : 'border-slate-200 text-slate-400'}`}>
+                    No interview questions match "{interviewSearch}". Try searching for keywords like "pgvector", "overlap", "typo", or "scaling".
                   </div>
-                  <div className={`leading-relaxed space-y-1.5 ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
-                    <p><strong>1. HNSW Indexes in pgvector:</strong> Replace flat linear distance calculations with Hierarchical Navigable Small World graphs for &lt;10ms Approximate Nearest Neighbor (ANN) search.</p>
-                    <p><strong>2. Table Partitioning:</strong> Partition vector tables by Department/Tenant to restrict search scope.</p>
-                    <p><strong>3. Redis Vector Caching:</strong> Cache query embeddings and frequent question answers.</p>
-                    <p><strong>4. Vector Quantization:</strong> Apply scalar (int8) quantization to compress 768-dimension floats by 75% in memory.</p>
-                  </div>
-                </div>
+                )}
               </div>
             </div>
           </div>

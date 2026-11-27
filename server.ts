@@ -3,10 +3,14 @@ import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 import JSZip from 'jszip';
 import dotenv from 'dotenv';
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = 3000;
@@ -287,8 +291,6 @@ function loadVectorStoreFromFile() {
   }
 }
 
-loadVectorStoreFromFile();
-
 async function pullStoreFromGithubIntoMemory(replaceWithRemote = false): Promise<boolean> {
   const cfg = getServerGithubConfig();
   if (validateGithubParams(cfg)) return false;
@@ -489,15 +491,34 @@ function levenshteinDist(s1: string, s2: string): number {
   return v1[s2.length];
 }
 
+function splitCamelAndWords(text: string): string[] {
+  return text
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .replace(/[^\w\s#+.]/g, ' ')
+    .split(/\s+/)
+    .map(w => w.trim())
+    .filter(w => w.length > 1);
+}
+
 function computeWordSimilarity(w1: string, w2: string): number {
   if (w1 === w2) return 1.0;
   if (w1.length < 3 || w2.length < 3) return w1 === w2 ? 1.0 : 0;
-  if (w1.startsWith(w2) || w2.startsWith(w1)) return 0.92;
-  if (w1.includes(w2) || w2.includes(w1)) return 0.88;
-  const dist = levenshteinDist(w1, w2);
+
+  const minLen = Math.min(w1.length, w2.length);
   const maxLen = Math.max(w1.length, w2.length);
-  if (dist <= 2 && maxLen >= 5) return 1 - (dist / maxLen);
-  if (dist === 1) return 0.85;
+  const lenRatio = minLen / maxLen;
+
+  if (minLen >= 4 && lenRatio >= 0.60 && (w1.startsWith(w2) || w2.startsWith(w1))) {
+    return 0.92;
+  }
+  if (minLen >= 5 && lenRatio >= 0.70 && (w1.includes(w2) || w2.includes(w1))) {
+    return 0.88;
+  }
+
+  const dist = levenshteinDist(w1, w2);
+  if (dist <= 2 && maxLen >= 5 && lenRatio >= 0.70) return 1 - (dist / maxLen);
+  if (dist === 1 && minLen >= 4) return 0.85;
   return 0;
 }
 
@@ -520,43 +541,36 @@ function scoreChunkRelevance(
   query: string,
   chunk: { title?: string; documentTitle?: string; content: string }
 ): number {
-  const normalizedQuery = query.toLowerCase();
-  const rawWords = normalizedQuery
-    .replace(/[^\w\s#+.]/g, ' ')
-    .split(/\s+/)
-    .map(w => w.trim())
-    .filter(w => w.length > 1);
-
+  const rawWords = splitCamelAndWords(query);
   const contentWords = rawWords.filter(w => !STOP_WORDS.has(w));
   const queryTerms = contentWords.length > 0 ? contentWords : rawWords;
 
   if (queryTerms.length === 0) return 0;
 
-  const title = (chunk.title || chunk.documentTitle || '').toLowerCase();
-  const contentLower = chunk.content.toLowerCase();
-  const chunkWords = (title + ' ' + contentLower)
-    .replace(/[^\w\s#+.]/g, ' ')
-    .split(/\s+/)
-    .filter(w => w.length > 1);
+  const titleTokens = splitCamelAndWords(chunk.title || chunk.documentTitle || '');
+  const titleTokenSet = new Set(titleTokens);
+  const contentTokens = splitCamelAndWords(chunk.content);
+  const contentTokenSet = new Set(contentTokens);
+  const allTokens = Array.from(new Set([...titleTokens, ...contentTokens]));
 
   let totalTermScore = 0;
 
   for (const qTerm of queryTerms) {
     let bestTermScore = 0;
 
-    if (contentLower.includes(qTerm)) {
+    if (contentTokenSet.has(qTerm)) {
       bestTermScore = Math.max(bestTermScore, 1.0);
     }
-    if (title.includes(qTerm)) {
+    if (titleTokenSet.has(qTerm)) {
       bestTermScore = Math.max(bestTermScore, 1.2);
     }
 
     if (bestTermScore < 1.0) {
-      for (const cWord of chunkWords) {
+      for (const cWord of allTokens) {
         const sim = computeWordSimilarity(qTerm, cWord);
-        if (sim >= 0.70) {
+        if (sim >= 0.72) {
           bestTermScore = Math.max(bestTermScore, sim);
-          if (title.includes(cWord)) {
+          if (titleTokenSet.has(cWord)) {
             bestTermScore += 0.25;
           }
           if (bestTermScore >= 1.0) break;
@@ -564,7 +578,7 @@ function scoreChunkRelevance(
       }
     }
 
-    if (bestTermScore >= 0.65) {
+    if (bestTermScore >= 0.72) {
       totalTermScore += bestTermScore;
     }
   }
@@ -572,9 +586,11 @@ function scoreChunkRelevance(
   const coverage = totalTermScore / queryTerms.length;
   let titleBonus = 0;
   for (const qTerm of queryTerms) {
-    const titleSim = computeWordSimilarity(qTerm, title);
-    if (titleSim >= 0.75) {
-      titleBonus = Math.max(titleBonus, 0.40);
+    for (const tWord of titleTokens) {
+      const titleSim = computeWordSimilarity(qTerm, tWord);
+      if (titleSim >= 0.78) {
+        titleBonus = Math.max(titleBonus, 0.40);
+      }
     }
   }
 
@@ -584,7 +600,7 @@ function scoreChunkRelevance(
 // Helper: Deterministic Local Vector Hashing (for offline or fallback)
 function generateDeterministicVector(text: string, dimensions = 768): number[] {
   const vector = new Array(dimensions).fill(0);
-  const words = text.toLowerCase().split(/[\s,.;:!?\n\r]+/);
+  const words = splitCamelAndWords(text).filter(w => !STOP_WORDS.has(w));
   for (let i = 0; i < words.length; i++) {
     const word = words[i];
     if (!word) continue;
@@ -603,6 +619,8 @@ function generateDeterministicVector(text: string, dimensions = 768): number[] {
   const norm = Math.sqrt(sumSq) || 1;
   return vector.map(v => v / norm);
 }
+
+loadVectorStoreFromFile();
 
 // Generate real embedding using Gemini or deterministic fallback
 async function getEmbedding(text: string): Promise<number[]> {

@@ -145,15 +145,35 @@ function levenshteinDist(s1: string, s2: string): number {
   return v1[s2.length];
 }
 
+function splitCamelAndWords(text: string): string[] {
+  return text
+    .replace(/([a-z])([A-Z])/g, '$1 $2')
+    .toLowerCase()
+    .replace(/[^\w\s#+.]/g, ' ')
+    .split(/\s+/)
+    .map(w => w.trim())
+    .filter(w => w.length > 1);
+}
+
 function computeWordSimilarity(w1: string, w2: string): number {
   if (w1 === w2) return 1.0;
   if (w1.length < 3 || w2.length < 3) return w1 === w2 ? 1.0 : 0;
-  if (w1.startsWith(w2) || w2.startsWith(w1)) return 0.92;
-  if (w1.includes(w2) || w2.includes(w1)) return 0.88;
-  const dist = levenshteinDist(w1, w2);
+
+  const minLen = Math.min(w1.length, w2.length);
   const maxLen = Math.max(w1.length, w2.length);
-  if (dist <= 2 && maxLen >= 5) return 1 - (dist / maxLen);
-  if (dist === 1) return 0.85;
+  const lenRatio = minLen / maxLen;
+
+  // Prefix/substring similarity only when the shorter token represents most of the longer word
+  if (minLen >= 4 && lenRatio >= 0.60 && (w1.startsWith(w2) || w2.startsWith(w1))) {
+    return 0.92;
+  }
+  if (minLen >= 5 && lenRatio >= 0.70 && (w1.includes(w2) || w2.includes(w1))) {
+    return 0.88;
+  }
+
+  const dist = levenshteinDist(w1, w2);
+  if (dist <= 2 && maxLen >= 5 && lenRatio >= 0.70) return 1 - (dist / maxLen);
+  if (dist === 1 && minLen >= 4) return 0.85;
   return 0;
 }
 
@@ -176,24 +196,17 @@ function scoreChunkRelevance(
   query: string,
   chunk: { title?: string; content: string }
 ): { score: number; matchedWords: string[] } {
-  const normalizedQuery = query.toLowerCase();
-  const rawWords = normalizedQuery
-    .replace(/[^\w\s#+.]/g, ' ')
-    .split(/\s+/)
-    .map(w => w.trim())
-    .filter(w => w.length > 1);
-
+  const rawWords = splitCamelAndWords(query);
   const contentWords = rawWords.filter(w => !STOP_WORDS.has(w));
   const queryTerms = contentWords.length > 0 ? contentWords : rawWords;
 
   if (queryTerms.length === 0) return { score: 0, matchedWords: [] };
 
-  const title = (chunk.title || '').toLowerCase();
-  const contentLower = chunk.content.toLowerCase();
-  const chunkWords = (title + ' ' + contentLower)
-    .replace(/[^\w\s#+.]/g, ' ')
-    .split(/\s+/)
-    .filter(w => w.length > 1);
+  const titleTokens = splitCamelAndWords(chunk.title || '');
+  const titleTokenSet = new Set(titleTokens);
+  const contentTokens = splitCamelAndWords(chunk.content);
+  const contentTokenSet = new Set(contentTokens);
+  const allTokens = Array.from(new Set([...titleTokens, ...contentTokens]));
 
   const matchedWords: string[] = [];
   let totalTermScore = 0;
@@ -201,19 +214,19 @@ function scoreChunkRelevance(
   for (const qTerm of queryTerms) {
     let bestTermScore = 0;
 
-    if (contentLower.includes(qTerm)) {
+    if (contentTokenSet.has(qTerm)) {
       bestTermScore = Math.max(bestTermScore, 1.0);
     }
-    if (title.includes(qTerm)) {
+    if (titleTokenSet.has(qTerm)) {
       bestTermScore = Math.max(bestTermScore, 1.2);
     }
 
     if (bestTermScore < 1.0) {
-      for (const cWord of chunkWords) {
+      for (const cWord of allTokens) {
         const sim = computeWordSimilarity(qTerm, cWord);
-        if (sim >= 0.70) {
+        if (sim >= 0.72) {
           bestTermScore = Math.max(bestTermScore, sim);
-          if (title.includes(cWord)) {
+          if (titleTokenSet.has(cWord)) {
             bestTermScore += 0.25;
           }
           if (bestTermScore >= 1.0) break;
@@ -221,7 +234,7 @@ function scoreChunkRelevance(
       }
     }
 
-    if (bestTermScore >= 0.65) {
+    if (bestTermScore >= 0.72) {
       matchedWords.push(qTerm);
       totalTermScore += bestTermScore;
     }
@@ -230,9 +243,11 @@ function scoreChunkRelevance(
   const coverage = totalTermScore / queryTerms.length;
   let titleBonus = 0;
   for (const qTerm of queryTerms) {
-    const titleSim = computeWordSimilarity(qTerm, title);
-    if (titleSim >= 0.75) {
-      titleBonus = Math.max(titleBonus, 0.40);
+    for (const tWord of titleTokens) {
+      const titleSim = computeWordSimilarity(qTerm, tWord);
+      if (titleSim >= 0.78) {
+        titleBonus = Math.max(titleBonus, 0.40);
+      }
     }
   }
 

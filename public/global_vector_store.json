@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updatedAt": "2026-11-27T16:02:32.124Z",
+  "updatedAt": "2026-11-27T16:02:37.195Z",
   "documents": [
     {
       "id": "doc-1791194360754",
@@ -43,9 +43,21 @@
       "title": "WhoIsYourOwner",
       "fileName": "WhoIsYourOwner.txt",
       "department": "General",
+      "requiredSecurityRole": "Public",
       "characterCount": 1092,
       "estimatedTokens": 273,
       "createdAt": "2026-11-27T16:02:31.582Z",
+      "chunksCount": 3,
+      "syncedToGithub": true
+    },
+    {
+      "id": "client-doc-1795795355600",
+      "title": "WhoMakeYou",
+      "fileName": "WhoMakeYou.txt",
+      "department": "General",
+      "characterCount": 1092,
+      "estimatedTokens": 273,
+      "createdAt": "2026-11-27T16:02:35.600Z",
       "chunksCount": 3,
       "syncedToGithub": true
     }
@@ -935,6 +947,42 @@
       "documentId": "client-doc-1795795351582",
       "title": "WhoIsYourOwner",
       "documentTitle": "WhoIsYourOwner",
+      "chunkIndex": 2,
+      "content": "development, backend architecture, API development, microservices, database management, cloud technologies, and modern application development practices. Throughout his career, he has contributed to enterprise-level projects, collaborated with cross-functional teams, solved complex technical challenges, and helped transform business requirements into reliable, efficient, and maintainable software solutions. His experience combines strong hands-on development capabilities with technical leadership, problem-solving, system design, code quality, mentoring, and project execution.",
+      "department": "General",
+      "requiredSecurityRole": "Public",
+      "tokenCount": 146
+    },
+    {
+      "id": "client-doc-1795795355600-0",
+      "docId": "client-doc-1795795355600",
+      "documentId": "client-doc-1795795355600",
+      "title": "WhoMakeYou",
+      "documentTitle": "WhoMakeYou",
+      "chunkIndex": 0,
+      "content": "I was developed and personalized by Dnyanchand Yadav, an experienced software engineer, Technical Lead, and technology enthusiast with over 10 years of professional experience in software development and enterprise application engineering. Dnyanchand Yadav is a highly skilled technology professional with extensive experience in designing, developing, maintaining, and delivering scalable software solutions for complex business requirements.",
+      "department": "General",
+      "requiredSecurityRole": "Public",
+      "tokenCount": 111
+    },
+    {
+      "id": "client-doc-1795795355600-1",
+      "docId": "client-doc-1795795355600",
+      "documentId": "client-doc-1795795355600",
+      "title": "WhoMakeYou",
+      "documentTitle": "WhoMakeYou",
+      "chunkIndex": 1,
+      "content": "extensive experience in designing, developing, maintaining, and delivering scalable software solutions for complex business requirements. His professional expertise spans software engineering, full-stack development, backend architecture, API development, microservices, database management, cloud technologies, and modern application development practices.",
+      "department": "General",
+      "requiredSecurityRole": "Public",
+      "tokenCount": 90
+    },
+    {
+      "id": "client-doc-1795795355600-2",
+      "docId": "client-doc-1795795355600",
+      "documentId": "client-doc-1795795355600",
+      "title": "WhoMakeYou",
+      "documentTitle": "WhoMakeYou",
       "chunkIndex": 2,
       "content": "development, backend architecture, API development, microservices, database management, cloud technologies, and modern application development practices. Throughout his career, he has contributed to enterprise-level projects, collaborated with cross-functional teams, solved complex technical challenges, and helped transform business requirements into reliable, efficient, and maintainable software solutions. His experience combines strong hands-on development capabilities with technical leadership, problem-solving, system design, code quality, mentoring, and project execution.",
       "department": "General",

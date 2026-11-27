@@ -1036,7 +1036,10 @@ app.post(['/api/rag/query', '/api/v1/rag/query'], async (req: Request, res: Resp
 
     const cosineScore = cosineSimilarity(queryEmbedding, chunk.embedding);
     const relevanceScore = scoreChunkRelevance(question, chunk);
-    const effectiveCosine = cosineScore >= 0.45 ? cosineScore : 0;
+    const effectiveCosine =
+      cosineScore >= 0.68
+        ? cosineScore
+        : (cosineScore >= 0.52 && relevanceScore >= 0.20 ? cosineScore : 0);
     const combinedScore = Math.max(effectiveCosine, relevanceScore);
 
     if (combinedScore >= 0.30) {

@@ -38,10 +38,32 @@ export interface GithubSyncConfig {
   branch: string;
   filePath: string;
   token: string;
+  backendUrl?: string;
 }
 
 const VALID_SEGMENT_RE = /^[a-zA-Z0-9._-]+$/;
 const VALID_BRANCH_RE = /^[a-zA-Z0-9._/-]+$/;
+
+export function normalizeBackendUrl(rawUrl?: string): string {
+  const trimmed = (rawUrl || '').trim();
+  if (!trimmed) return '';
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return '';
+    }
+    const cleanPath = parsed.pathname.replace(/\/+$/, '');
+    return `${parsed.origin}${cleanPath === '/' ? '' : cleanPath}`;
+  } catch {
+    return '';
+  }
+}
+
+export function buildApiUrl(apiPath: string, config?: Pick<GithubSyncConfig, 'backendUrl'>): string {
+  const normalizedPath = apiPath.startsWith('/') ? apiPath : `/${apiPath}`;
+  const base = normalizeBackendUrl(config?.backendUrl);
+  return base ? `${base}${normalizedPath}` : normalizedPath;
+}
 
 export function parseGithubRepoString(
   rawRepo?: string,
@@ -81,7 +103,7 @@ export function parseGithubRepoString(
   return { owner: fallbackOwner, repo: cleaned || fallbackRepo };
 }
 
-export function normalizeGithubStorePath(rawPath?: string): string {
+export function normalizeGithubStorePath(rawPath?: string, branch = 'main'): string {
   let p = (rawPath || '').trim();
   if (!p) return 'public/global_vector_store.json';
   // If user pasted a GitHub blob/raw URL, extract path after branch
@@ -89,7 +111,15 @@ export function normalizeGithubStorePath(rawPath?: string): string {
   if (blobMatch) p = blobMatch[1];
   const rawMatch = p.match(/^https?:\/\/raw\.githubusercontent\.com\/[^/]+\/[^/]+\/[^/]+\/(.+)$/i);
   if (rawMatch) p = rawMatch[1];
-  return p.replace(/^[./]+/, '') || 'public/global_vector_store.json';
+  p = p.replace(/^[./]+/, '').replace(/\/+$/, '');
+  if (branch && p.startsWith(`${branch}/`) && p.length > branch.length + 1) {
+    p = p.slice(branch.length + 1);
+  }
+  if (!p) return 'public/global_vector_store.json';
+  if (!/\.json$/i.test(p)) {
+    p = `${p}/global_vector_store.json`;
+  }
+  return p;
 }
 
 export function detectDefaultGithubRepo(): { owner: string; repo: string } {
@@ -111,6 +141,7 @@ export function detectDefaultGithubRepo(): { owner: string; repo: string } {
 
 export function loadGithubSyncConfig(): GithubSyncConfig {
   const detected = detectDefaultGithubRepo();
+  const envBackendUrl = normalizeBackendUrl((import.meta as any).env?.VITE_BACKEND_URL || '');
   try {
     const raw = localStorage.getItem('genie_github_sync_config');
     const savedToken = localStorage.getItem('genie_github_token') || '';
@@ -122,12 +153,14 @@ export function loadGithubSyncConfig(): GithubSyncConfig {
             owner: (parsed.owner || detected.owner).trim(),
             repo: (parsed.repo || detected.repo).trim()
           };
+      const resolvedBranch = (parsed.branch || 'main').trim() || 'main';
       return {
         owner: parsedOwnerRepo.owner,
         repo: parsedOwnerRepo.repo,
-        branch: (parsed.branch || 'main').trim(),
-        filePath: normalizeGithubStorePath(parsed.filePath),
-        token: savedToken.trim()
+        branch: resolvedBranch,
+        filePath: normalizeGithubStorePath(parsed.filePath, resolvedBranch),
+        token: savedToken.trim(),
+        backendUrl: normalizeBackendUrl(parsed.backendUrl) || envBackendUrl
       };
     }
     return {
@@ -135,7 +168,8 @@ export function loadGithubSyncConfig(): GithubSyncConfig {
       repo: detected.repo,
       branch: 'main',
       filePath: 'public/global_vector_store.json',
-      token: savedToken.trim()
+      token: savedToken.trim(),
+      backendUrl: envBackendUrl
     };
   } catch {
     return {
@@ -143,7 +177,8 @@ export function loadGithubSyncConfig(): GithubSyncConfig {
       repo: detected.repo,
       branch: 'main',
       filePath: 'public/global_vector_store.json',
-      token: ''
+      token: '',
+      backendUrl: envBackendUrl
     };
   }
 }
@@ -152,13 +187,15 @@ export function saveGithubSyncConfig(config: GithubSyncConfig): GithubSyncConfig
   const parsedRepo = config.repo.includes('/') || config.repo.includes('github.')
     ? parseGithubRepoString(config.repo, config.owner || 'dpxtd-ai', 'genie_ai')
     : { owner: config.owner.trim(), repo: config.repo.trim() };
+  const resolvedBranch = config.branch.trim() || 'main';
 
   const normalized: GithubSyncConfig = {
     owner: parsedRepo.owner,
     repo: parsedRepo.repo,
-    branch: config.branch.trim() || 'main',
-    filePath: normalizeGithubStorePath(config.filePath),
-    token: (config.token || '').trim()
+    branch: resolvedBranch,
+    filePath: normalizeGithubStorePath(config.filePath, resolvedBranch),
+    token: (config.token || '').trim(),
+    backendUrl: normalizeBackendUrl(config.backendUrl)
   };
 
   localStorage.setItem(
@@ -167,7 +204,8 @@ export function saveGithubSyncConfig(config: GithubSyncConfig): GithubSyncConfig
       owner: normalized.owner,
       repo: normalized.repo,
       branch: normalized.branch,
-      filePath: normalized.filePath
+      filePath: normalized.filePath,
+      backendUrl: normalized.backendUrl || ''
     })
   );
   if (normalized.token) {
@@ -188,7 +226,7 @@ export function validateGithubConfig(config: Pick<GithubSyncConfig, 'owner' | 'r
   if (!config.branch || !VALID_BRANCH_RE.test(config.branch) || config.branch.includes('..')) {
     return 'Invalid branch name.';
   }
-  const cleanPath = normalizeGithubStorePath(config.filePath);
+  const cleanPath = normalizeGithubStorePath(config.filePath, config.branch);
   if (!cleanPath || cleanPath.includes('..') || !/^[a-zA-Z0-9._/-]+\.json$/.test(cleanPath)) {
     return 'File path must be a relative .json path inside the repository (e.g., public/global_vector_store.json).';
   }

@@ -48,7 +48,9 @@ import {
   forceDeleteFromGithub,
   testGithubConnection,
   normalizeDoc,
-  normalizeChunk
+  normalizeChunk,
+  normalizeBackendUrl,
+  buildApiUrl
 } from './githubStore';
 
 // Configure marked for GitHub-Flavored Markdown
@@ -250,10 +252,15 @@ export default function App() {
     }
   });
   const [isUploading, setIsUploading] = useState(false);
-  const [uploadMessage, setUploadMessage] = useState<{ text: string; isError?: boolean } | null>(null);
+  const [uploadMessage, setUploadMessage] = useState<{
+    text: string;
+    variant?: 'success' | 'warning' | 'error';
+    needsGithubSync?: boolean;
+  } | null>(null);
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const jsonInputRef = useRef<HTMLInputElement>(null);
+  const lastSyncAtRef = useRef<number>(0);
 
   // Option 2: AI Chat State
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
@@ -398,7 +405,7 @@ export default function App() {
 
     // 1. Try server-side validation first (for Node/Cloud Run/Local environments)
     try {
-      const res = await fetch('/api/gemini/validate-key', {
+      const res = await fetch(buildApiUrl('/api/gemini/validate-key', githubConfig), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ apiKey: keyInput.trim() })
@@ -455,6 +462,26 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    const maybeAutoRefresh = () => {
+      if (document.visibilityState === 'visible' && Date.now() - lastSyncAtRef.current >= 30_000) {
+        fetchDocuments();
+      }
+    };
+    window.addEventListener('focus', maybeAutoRefresh);
+    document.addEventListener('visibilitychange', maybeAutoRefresh);
+    return () => {
+      window.removeEventListener('focus', maybeAutoRefresh);
+      document.removeEventListener('visibilitychange', maybeAutoRefresh);
+    };
+  }, [githubConfig]);
+
+  useEffect(() => {
+    if ((activeOption === 'upload' || activeOption === 'chat') && Date.now() - lastSyncAtRef.current >= 30_000) {
+      fetchDocuments();
+    }
+  }, [activeOption]);
+
+  useEffect(() => {
     localStorage.setItem('genie_theme', theme);
   }, [theme]);
 
@@ -468,18 +495,24 @@ export default function App() {
     setTheme(prev => prev === 'dark' ? 'light' : 'dark');
   };
 
-  const fetchDocuments = async (overrideConfig?: GithubSyncConfig) => {
+  const fetchDocuments = async (overrideConfig?: GithubSyncConfig): Promise<{
+    serverGithubConfigured: boolean;
+    docs: StoredDoc[];
+    chunks: ClientChunk[];
+  }> => {
     const activeGhConfig = overrideConfig || githubConfig;
     let remoteDocs: StoredDoc[] = [];
     let remoteChunks: ClientChunk[] = [];
     let fetchedRemote = false;
+    let detectedServerGithub = serverGithubConfigured;
 
-    // 1. Try full-stack backend global store first (when Node server is running)
+    // 1. Try full-stack backend global store first (when Node server or Backend URL is configured)
     try {
-      const res = await fetch(`/api/global-store?t=${Date.now()}`, { cache: 'no-store' });
+      const res = await fetch(buildApiUrl(`/api/global-store?t=${Date.now()}`, activeGhConfig), { cache: 'no-store' });
       if (res.ok) {
         const data = await res.json();
         if (typeof data.githubConfigured === 'boolean') {
+          detectedServerGithub = data.githubConfigured;
           setServerGithubConfigured(data.githubConfigured);
         }
         if (!overrideConfig && data.githubOwner && data.githubRepoName) {
@@ -488,7 +521,8 @@ export default function App() {
             repo: data.githubRepoName,
             branch: data.githubBranch || 'main',
             filePath: data.githubStorePath || 'public/global_vector_store.json',
-            token: activeGhConfig.token
+            token: activeGhConfig.token,
+            backendUrl: activeGhConfig.backendUrl
           };
           setGithubConfig(syncedCfg);
           saveGithubSyncConfig(syncedCfg);
@@ -569,6 +603,7 @@ export default function App() {
 
     setDocuments(finalDocs);
     setClientChunks(finalChunks);
+    lastSyncAtRef.current = Date.now();
 
     try {
       localStorage.setItem('genie_stored_documents', JSON.stringify(finalDocs));
@@ -576,6 +611,12 @@ export default function App() {
     } catch (err) {
       console.warn('LocalStorage update error:', err);
     }
+
+    return {
+      serverGithubConfigured: detectedServerGithub,
+      docs: finalDocs,
+      chunks: finalChunks
+    };
   };
 
   const getFallbackCodeFiles = (): CodeFileItem[] => [
@@ -735,7 +776,7 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
 
   const fetchCodeFiles = async () => {
     try {
-      const res = await fetch('/api/rag/code-files');
+      const res = await fetch(buildApiUrl('/api/rag/code-files', githubConfig));
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data) && data.length > 0) {
@@ -768,7 +809,7 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
         const title = file.name.replace(/\.[^/.]+$/, '').replace(/[-_]/g, ' ');
 
         try {
-          const res = await fetch('/api/documents/upload-file', {
+          const res = await fetch(buildApiUrl('/api/documents/upload-file', githubConfig), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -780,25 +821,34 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
 
           if (res.ok) {
             const data = await res.json();
+            let syncedGlobally = Boolean(data.githubSync?.synced);
             let syncMsg = '';
-            if (data.githubSync?.synced) {
-              syncMsg = ' Synced globally to GitHub repository for all devices.';
+            let syncWarn = false;
+            if (syncedGlobally) {
+              syncMsg = ' Synced globally to GitHub repository for all users & browsers.';
             } else if (githubConfig.token) {
               try {
-                const gsRes = await fetch('/api/global-store');
+                const gsRes = await fetch(buildApiUrl('/api/global-store', githubConfig));
                 if (gsRes.ok) {
                   const gsData = await gsRes.json();
                   const docOnly = (gsData.documents || []).filter((d: any) => d.id === data.documentId).map((d: any) => normalizeDoc(d, true));
                   const chunksOnly = (gsData.chunks || []).filter((c: any) => (c.docId || c.documentId) === data.documentId).map(normalizeChunk);
                   await mergeDocumentsIntoGithub(githubConfig, docOnly, chunksOnly, `chore(vector-store): upload chunks for ${file.name}`);
-                  syncMsg = ' Synced globally to GitHub repository for all devices.';
+                  syncedGlobally = true;
+                  syncMsg = ' Synced globally to GitHub repository for all users & browsers.';
                 }
               } catch (ghErr: any) {
+                syncWarn = true;
                 syncMsg = ` Saved on server, but GitHub global sync failed: ${ghErr.message}`;
               }
+            } else {
+              syncWarn = true;
+              syncMsg = ' Saved on server only. Configure GitHub Sync to share across all browsers.';
             }
             setUploadMessage({
-              text: `Successfully ingested "${file.name}"! Created ${data.chunksCreated} vector embeddings.${syncMsg}`
+              text: `Ingested "${file.name}" (${data.chunksCreated} vector chunks).${syncMsg}`,
+              variant: syncWarn ? 'warning' : 'success',
+              needsGithubSync: syncWarn
             });
             await fetchDocuments();
             return;
@@ -918,12 +968,15 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
 
         setUploadMessage({
           text: syncedGlobal
-            ? `Uploaded "${file.name}" (${newChunks.length} chunks) and committed permanently to GitHub (${githubConfig.owner}/${githubConfig.repo}/${githubConfig.filePath}). Accessible globally on all devices until force-deleted!`
-            : `Ingested "${file.name}" (${newChunks.length} chunks) locally.${syncNote || ' Configure your GitHub Token in "GitHub Sync" to store this file permanently on the GitHub server for all devices.'}`,
-          isError: Boolean(syncNote)
+            ? `Uploaded "${file.name}" (${newChunks.length} chunks) and committed permanently to GitHub (${githubConfig.owner}/${githubConfig.repo}/${githubConfig.filePath}). Accessible globally on all browsers & devices until force-deleted!`
+            : syncNote
+            ? `Saved "${file.name}" (${newChunks.length} chunks) in this browser only.${syncNote}`
+            : `Saved "${file.name}" (${newChunks.length} chunks) in this browser ONLY (Local Pending Sync). Other browsers will NOT see it until you configure a GitHub Write Token or Backend Server URL in "GitHub Sync".`,
+          variant: syncedGlobal ? 'success' : 'warning',
+          needsGithubSync: !syncedGlobal
         });
       } catch (err: any) {
-        setUploadMessage({ text: err.message || 'Error processing file', isError: true });
+        setUploadMessage({ text: err.message || 'Error processing file', variant: 'error' });
       } finally {
         setIsUploading(false);
       }
@@ -932,9 +985,21 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
     reader.readAsDataURL(file);
   };
 
-  const handlePushAllToGithub = async (overrideCfg?: GithubSyncConfig) => {
+  const handlePushAllToGithub = async (
+    overrideCfg?: GithubSyncConfig,
+    overrideServerConfigured?: boolean,
+    overrideDocs?: StoredDoc[],
+    overrideChunks?: ClientChunk[]
+  ) => {
     const cfg = overrideCfg || githubConfig;
-    if (!cfg.token && !serverGithubConfigured) {
+    const activeDocs = overrideDocs || documents;
+    const activeChunks = overrideChunks || clientChunks;
+    const canUseServer = Boolean(
+      overrideServerConfigured !== undefined
+        ? overrideServerConfigured
+        : serverGithubConfigured || cfg.backendUrl
+    );
+    if (!cfg.token && !canUseServer) {
       setGhDraft(cfg);
       setShowGithubModal(true);
       return;
@@ -943,8 +1008,8 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
     setUploadMessage(null);
     try {
       // 1. Try server-side GitHub sync first (uses server GITHUB_TOKEN / GITHUB_REPO / GITHUB_BRANCH / GITHUB_STORE_PATH)
-      if (!cfg.token && serverGithubConfigured) {
-        const serverResp = await fetch('/api/github/sync', {
+      if (!cfg.token && canUseServer) {
+        const serverResp = await fetch(buildApiUrl('/api/github/sync', cfg), {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -952,8 +1017,8 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
             repo: cfg.repo,
             branch: cfg.branch,
             filePath: cfg.filePath,
-            documents,
-            chunks: clientChunks
+            documents: activeDocs,
+            chunks: activeChunks
           })
         });
         const serverData = await serverResp.json();
@@ -962,7 +1027,8 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
         }
         await fetchDocuments(cfg);
         setUploadMessage({
-          text: `Synced ${serverData.documentsCount ?? documents.length} document(s) & ${serverData.chunksCount ?? clientChunks.length} chunks to GitHub (${cfg.owner}/${cfg.repo} on branch "${cfg.branch}"). Globally accessible across all devices!`
+          text: `Synced ${serverData.documentsCount ?? activeDocs.length} document(s) & ${serverData.chunksCount ?? activeChunks.length} chunks to GitHub (${cfg.owner}/${cfg.repo} on branch "${cfg.branch}"). Globally accessible across all browsers & devices!`,
+          variant: 'success'
         });
         return;
       }
@@ -970,9 +1036,9 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
       // 2. Direct browser GitHub sync (for GitHub Pages static hosting or custom browser token)
       const merged = await mergeDocumentsIntoGithub(
         cfg,
-        documents.map(d => normalizeDoc(d, true)),
-        clientChunks.map(normalizeChunk),
-        `chore(vector-store): sync ${documents.length} document(s) to global store`
+        activeDocs.map(d => normalizeDoc(d, true)),
+        activeChunks.map(normalizeChunk),
+        `chore(vector-store): sync ${activeDocs.length} document(s) to global store`
       );
       const syncedDocs = merged.documents.map(d => normalizeDoc(d, true));
       const syncedChunks = merged.chunks.map(normalizeChunk);
@@ -982,12 +1048,81 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
       localStorage.setItem('genie_stored_documents', JSON.stringify(syncedDocs));
       localStorage.setItem('genie_stored_chunks', JSON.stringify(syncedChunks));
       setUploadMessage({
-        text: `Synced ${syncedDocs.length} document(s) & ${syncedChunks.length} chunks to GitHub (${cfg.owner}/${cfg.repo}/${cfg.filePath}). Globally accessible across all devices!`
+        text: `Synced ${syncedDocs.length} document(s) & ${syncedChunks.length} chunks to GitHub (${cfg.owner}/${cfg.repo}/${cfg.filePath}). Globally accessible across all browsers & devices!`,
+        variant: 'success'
       });
     } catch (err: any) {
       setUploadMessage({
         text: `GitHub sync failed: ${err?.message || String(err)}`,
-        isError: true
+        variant: 'error',
+        needsGithubSync: true
+      });
+    } finally {
+      setIsSyncingGithub(false);
+    }
+  };
+
+  const handlePushSingleDoc = async (doc: StoredDoc) => {
+    const canUseServer = Boolean(serverGithubConfigured || githubConfig.backendUrl);
+    if (!githubConfig.token && !canUseServer) {
+      setGhDraft(githubConfig);
+      setGithubTestResult(null);
+      setShowGithubModal(true);
+      return;
+    }
+
+    setIsSyncingGithub(true);
+    setUploadMessage(null);
+    const docChunks = clientChunks.filter(c => c.docId === doc.id || (c as any).documentId === doc.id);
+
+    try {
+      if (!githubConfig.token && canUseServer) {
+        const serverResp = await fetch(buildApiUrl('/api/github/sync', githubConfig), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            owner: githubConfig.owner,
+            repo: githubConfig.repo,
+            branch: githubConfig.branch,
+            filePath: githubConfig.filePath,
+            documents: [normalizeDoc(doc, true)],
+            chunks: docChunks.map(normalizeChunk)
+          })
+        });
+        const serverData = await serverResp.json();
+        if (!serverResp.ok || !serverData.synced) {
+          throw new Error(serverData.message || 'Server GitHub sync failed.');
+        }
+        await fetchDocuments(githubConfig);
+        setUploadMessage({
+          text: `Pushed "${doc.fileName}" globally to GitHub (${githubConfig.owner}/${githubConfig.repo}). Other browsers can now see it!`,
+          variant: 'success'
+        });
+        return;
+      }
+
+      const merged = await mergeDocumentsIntoGithub(
+        githubConfig,
+        [normalizeDoc(doc, true)],
+        docChunks.map(normalizeChunk),
+        `chore(vector-store): upload chunks for ${doc.fileName}`
+      );
+      const syncedDocs = merged.documents.map(d => normalizeDoc(d, true));
+      const syncedChunks = merged.chunks.map(normalizeChunk);
+      setDocuments(syncedDocs);
+      setClientChunks(syncedChunks);
+      setGlobalSourceLabel('github-live');
+      localStorage.setItem('genie_stored_documents', JSON.stringify(syncedDocs));
+      localStorage.setItem('genie_stored_chunks', JSON.stringify(syncedChunks));
+      setUploadMessage({
+        text: `Pushed "${doc.fileName}" globally to GitHub (${githubConfig.owner}/${githubConfig.repo}). Other browsers can now see it!`,
+        variant: 'success'
+      });
+    } catch (err: any) {
+      setUploadMessage({
+        text: `Could not push "${doc.fileName}": ${err?.message || String(err)}`,
+        variant: 'error',
+        needsGithubSync: true
       });
     } finally {
       setIsSyncingGithub(false);
@@ -1004,14 +1139,21 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
     try {
       if (forceDeleteModal.mode === 'single') {
         const targetId = forceDeleteModal.doc.id;
+        let serverDeletedOnGithub = false;
         try {
-          await fetch(`/api/documents/${encodeURIComponent(targetId)}`, { method: 'DELETE' });
+          const delRes = await fetch(buildApiUrl(`/api/documents/${encodeURIComponent(targetId)}`, githubConfig), {
+            method: 'DELETE'
+          });
+          if (delRes.ok) {
+            const delData = await delRes.json().catch(() => ({}));
+            serverDeletedOnGithub = Boolean(delData?.githubSync?.synced);
+          }
         } catch {
           // Ignore on static hosting
         }
 
-        let ghNotice = '';
-        if (githubConfig.token && forceDeleteModal.doc.syncedToGithub !== false) {
+        let ghNotice = serverDeletedOnGithub ? ' Permanently removed from GitHub global store.' : '';
+        if (!serverDeletedOnGithub && githubConfig.token && forceDeleteModal.doc.syncedToGithub !== false) {
           try {
             await forceDeleteFromGithub(
               githubConfig,
@@ -1034,17 +1176,23 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
         } catch {}
 
         setUploadMessage({
-          text: `Force-deleted "${forceDeleteModal.doc.fileName}".${ghNotice}`
+          text: `Force-deleted "${forceDeleteModal.doc.fileName}".${ghNotice}`,
+          variant: 'success'
         });
       } else {
+        let serverClearedOnGithub = false;
         try {
-          await fetch('/api/documents/clear-all', { method: 'POST' });
+          const clearRes = await fetch(buildApiUrl('/api/documents/clear-all', githubConfig), { method: 'POST' });
+          if (clearRes.ok) {
+            const clearData = await clearRes.json().catch(() => ({}));
+            serverClearedOnGithub = Boolean(clearData?.githubSync?.synced);
+          }
         } catch {
           // Ignore on static hosting
         }
 
-        let ghNotice = '';
-        if (githubConfig.token) {
+        let ghNotice = serverClearedOnGithub ? ' Global GitHub chunk store cleared.' : '';
+        if (!serverClearedOnGithub && githubConfig.token) {
           try {
             await forceDeleteFromGithub(githubConfig, 'ALL', 'chore(vector-store): force delete all global documents');
             ghNotice = ' Global GitHub chunk store cleared.';
@@ -1060,7 +1208,8 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
           localStorage.removeItem('genie_stored_chunks');
         } catch {}
         setUploadMessage({
-          text: `Force-deleted all documents and vector chunks.${ghNotice}`
+          text: `Force-deleted all documents and vector chunks.${ghNotice}`,
+          variant: 'success'
         });
       }
     } finally {
@@ -1097,14 +1246,20 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
         const text = event.target?.result as string;
         const parsed = JSON.parse(text);
         if (Array.isArray(parsed.documents) && Array.isArray(parsed.chunks)) {
-          setDocuments(parsed.documents);
-          setClientChunks(parsed.chunks);
-          localStorage.setItem('genie_stored_documents', JSON.stringify(parsed.documents));
-          localStorage.setItem('genie_stored_chunks', JSON.stringify(parsed.chunks));
-          setUploadMessage({ text: `Successfully loaded ${parsed.documents.length} documents and ${parsed.chunks.length} chunks from backup file!` });
+          const importedDocs = parsed.documents.map((d: any) => normalizeDoc(d, Boolean(d.syncedToGithub)));
+          const importedChunks = parsed.chunks.map(normalizeChunk);
+          setDocuments(importedDocs);
+          setClientChunks(importedChunks);
+          localStorage.setItem('genie_stored_documents', JSON.stringify(importedDocs));
+          localStorage.setItem('genie_stored_chunks', JSON.stringify(importedChunks));
+          setUploadMessage({
+            text: `Loaded ${importedDocs.length} documents and ${importedChunks.length} chunks from backup file! Click "Push to GitHub" if you want to share them globally.`,
+            variant: 'warning',
+            needsGithubSync: importedDocs.some((d: StoredDoc) => !d.syncedToGithub)
+          });
         }
       } catch (err: any) {
-        setUploadMessage({ text: 'Invalid vector store JSON file.', isError: true });
+        setUploadMessage({ text: 'Invalid vector store JSON file.', variant: 'error' });
       }
     };
     reader.readAsText(file);
@@ -1131,7 +1286,7 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
 
     // Step 1: Try full-stack vector DB endpoint first
     try {
-      const res = await fetch('/api/rag/query', {
+      const res = await fetch(buildApiUrl('/api/rag/query', githubConfig), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1591,17 +1746,34 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
               {/* Upload Notification */}
               {uploadMessage && (
                 <div
-                  className={`mt-4 p-3 rounded-xl text-xs flex items-center gap-2 border ${
-                    uploadMessage.isError
+                  className={`mt-4 p-3 rounded-xl text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 border ${
+                    uploadMessage.variant === 'error'
                       ? isDark ? 'bg-rose-950/50 border-rose-800 text-rose-200' : 'bg-rose-50 border-rose-200 text-rose-700'
+                      : uploadMessage.variant === 'warning'
+                      ? isDark ? 'bg-amber-950/50 border-amber-700 text-amber-200' : 'bg-amber-50 border-amber-300 text-amber-800'
                       : isDark ? 'bg-emerald-950/50 border-emerald-700 text-emerald-200' : 'bg-emerald-50 border-emerald-200 text-emerald-700'
                   }`}>
-                  {uploadMessage.isError ? (
-                    <AlertCircle className="w-4 h-4 shrink-0" />
-                  ) : (
-                    <CheckCircle2 className="w-4 h-4 shrink-0" />
+                  <div className="flex items-start sm:items-center gap-2">
+                    {uploadMessage.variant === 'error' ? (
+                      <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 sm:mt-0" />
+                    ) : uploadMessage.variant === 'warning' ? (
+                      <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 sm:mt-0 text-amber-400" />
+                    ) : (
+                      <CheckCircle2 className="w-4 h-4 shrink-0 mt-0.5 sm:mt-0" />
+                    )}
+                    <span>{uploadMessage.text}</span>
+                  </div>
+                  {uploadMessage.needsGithubSync && (
+                    <button
+                      onClick={() => {
+                        setGhDraft(githubConfig);
+                        setGithubTestResult(null);
+                        setShowGithubModal(true);
+                      }}
+                      className="px-2.5 py-1 rounded-lg text-[11px] font-semibold shrink-0 bg-indigo-600 hover:bg-indigo-500 text-white transition-colors">
+                      Enable GitHub Sync &amp; Push
+                    </button>
                   )}
-                  <span>{uploadMessage.text}</span>
                 </div>
               )}
             </div>
@@ -1634,9 +1806,23 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
                               Global GitHub
                             </span>
                           ) : (
-                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono border ${isDark ? 'bg-amber-950/60 text-amber-300 border-amber-800/70' : 'bg-amber-50 text-amber-700 border-amber-200'}`}>
-                              Local Pending Sync
-                            </span>
+                            <>
+                              <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono border ${isDark ? 'bg-amber-950/60 text-amber-300 border-amber-800/70' : 'bg-amber-50 text-amber-700 border-amber-200'}`}>
+                                Local Pending Sync
+                              </span>
+                              <button
+                                onClick={() => handlePushSingleDoc(doc)}
+                                disabled={isSyncingGithub}
+                                className={`px-2 py-0.5 rounded text-[10px] font-semibold border flex items-center gap-1 transition-colors disabled:opacity-50 ${
+                                  isDark
+                                    ? 'bg-sky-950/70 hover:bg-sky-900/70 text-sky-300 border-sky-700/70'
+                                    : 'bg-sky-50 hover:bg-sky-100 text-sky-700 border-sky-200'
+                                }`}
+                                title="Push this local document to GitHub so all browsers & devices can access it">
+                                <Cloud className="w-3 h-3" />
+                                <span>{isSyncingGithub ? 'Pushing...' : 'Push'}</span>
+                              </button>
+                            </>
                           )}
                         </div>
                         <div className={`text-[11px] font-mono mt-0.5 truncate ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>
@@ -1782,7 +1968,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
                 </div>
 
                 <a
-                  href="/api/rag/download-zip"
+                  href={buildApiUrl('/api/rag/download-zip', githubConfig)}
                   download="rag_llm_angular_dotnet.zip"
                   className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-md shadow-indigo-600/20 transition-all shrink-0">
                   <Download className="w-4 h-4" />
@@ -2148,7 +2334,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
 
               <div className="flex items-center gap-2">
                 <a
-                  href="/api/rag/download-zip"
+                  href={buildApiUrl('/api/rag/download-zip', githubConfig)}
                   download="rag_llm_angular_dotnet.zip"
                   className={`px-3 py-1 border rounded-lg text-xs flex items-center gap-1.5 transition-colors ${isDark ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700' : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'}`}>
                   <Download className="w-3.5 h-3.5" />
@@ -2399,6 +2585,21 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
 
             <div className="space-y-2">
               <label className="text-xs font-semibold text-slate-300 block">
+                Backend Server URL <span className="font-normal text-slate-400">(Optional — bridges GitHub Pages to your hosted server)</span>
+              </label>
+              <input
+                type="url"
+                placeholder="https://your-server.run.app (leave blank on standalone GitHub Pages)"
+                value={ghDraft.backendUrl || ''}
+                onChange={(e) => setGhDraft({ ...ghDraft, backendUrl: e.target.value })}
+                className={`w-full px-3 py-2 text-xs font-mono rounded-xl border focus:outline-none focus:ring-2 focus:ring-sky-500 ${
+                  isDark ? 'bg-slate-950 border-slate-800 text-white' : 'bg-slate-50 border-slate-300 text-slate-900'
+                }`}
+              />
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-semibold text-slate-300 block">
                 GitHub Fine-Grained Personal Access Token (Write Access)
               </label>
               <input
@@ -2414,15 +2615,24 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
                 <span>
                   {serverGithubConfigured && !ghDraft.token
                     ? 'Server GITHUB_TOKEN is active. Leave blank to use server secret.'
-                    : <>Readers on other devices need NO token. Uploaders need <code className="text-sky-400">Contents: Read &amp; Write</code>.</>}
+                    : <>Readers on other devices need NO token. Uploaders need <code className="text-sky-400">Contents: Read &amp; Write</code> (or Backend Server URL).</>}
                 </span>
                 <div className="flex items-center gap-2 shrink-0">
                   <button
                     onClick={async () => {
+                      const rawBackend = (ghDraft.backendUrl || '').trim();
+                      if (rawBackend && !normalizeBackendUrl(rawBackend)) {
+                        setGithubTestResult({
+                          ok: false,
+                          canPush: false,
+                          message: 'Backend Server URL must start with http:// or https://.'
+                        });
+                        return;
+                      }
                       setTestingGithub(true);
                       setGithubTestResult(null);
                       try {
-                        const apiRes = await fetch('/api/github/test', {
+                        const apiRes = await fetch(buildApiUrl('/api/github/test', ghDraft), {
                           method: 'POST',
                           headers: { 'Content-Type': 'application/json' },
                           body: JSON.stringify(ghDraft)
@@ -2473,10 +2683,28 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
               </button>
               <button
                 onClick={async () => {
+                  const rawBackend = (ghDraft.backendUrl || '').trim();
+                  if (rawBackend && !normalizeBackendUrl(rawBackend)) {
+                    setGithubTestResult({
+                      ok: false,
+                      canPush: false,
+                      message: 'Backend Server URL must be a valid http:// or https:// URL.'
+                    });
+                    return;
+                  }
                   const normalized = saveGithubSyncConfig(ghDraft);
                   setGithubConfig(normalized);
                   setShowGithubModal(false);
-                  await fetchDocuments(normalized);
+                  const pendingDocsBeforeSync = documents.filter(d => d.syncedToGithub === false);
+                  const remoteInfo = await fetchDocuments(normalized);
+                  if (pendingDocsBeforeSync.length > 0 && (normalized.token || normalized.backendUrl || remoteInfo.serverGithubConfigured)) {
+                    await handlePushAllToGithub(
+                      normalized,
+                      remoteInfo.serverGithubConfigured,
+                      remoteInfo.docs,
+                      remoteInfo.chunks
+                    );
+                  }
                 }}
                 className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-sky-600 text-white hover:bg-sky-500 shadow-md shadow-sky-600/20">
                 Save &amp; Sync

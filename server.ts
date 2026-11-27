@@ -13,6 +13,40 @@ const PORT = 3000;
 
 app.use(express.json({ limit: '15mb' }));
 
+const ALLOWED_CORS_ORIGINS = new Set(
+  [
+    'https://dpxtd-ai.github.io',
+    'http://localhost:3000',
+    'http://localhost:4200',
+    'http://localhost:5173',
+    process.env.APP_URL ? process.env.APP_URL.trim().replace(/\/+$/, '') : ''
+  ].filter(Boolean)
+);
+
+app.use((req: Request, res: Response, next) => {
+  const originHeader = req.headers.origin;
+  if (originHeader) {
+    const normalizedOrigin = originHeader.trim().replace(/\/+$/, '');
+    const requestHost = req.get('x-forwarded-host') || req.get('host');
+    const isSameHostOrigin = Boolean(
+      requestHost &&
+      (normalizedOrigin === `https://${requestHost}` || normalizedOrigin === `http://${requestHost}`)
+    );
+
+    if (ALLOWED_CORS_ORIGINS.has(normalizedOrigin) || isSameHostOrigin) {
+      res.setHeader('Access-Control-Allow-Origin', normalizedOrigin);
+      res.setHeader('Vary', 'Origin');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    }
+
+    if (req.method === 'OPTIONS') {
+      return res.status(204).end();
+    }
+  }
+  next();
+});
+
 // Initialize GoogleGenAI SDK on server side with User-Agent header as required
 function getAiClient(customKey?: string): { ai: GoogleGenAI | null; apiKey: string } {
   const key = (customKey && customKey.trim().length > 0) ? customKey.trim() : (process.env.GEMINI_API_KEY || '');
@@ -103,14 +137,22 @@ function parseGithubRepoString(rawRepo?: string, fallbackOwner = 'dpxtd-ai', fal
   return { owner: fallbackOwner, repo: cleaned || fallbackRepo };
 }
 
-function normalizeGithubStorePath(rawPath?: string): string {
+function normalizeGithubStorePath(rawPath?: string, branch = 'main'): string {
   let p = (rawPath || '').trim();
   if (!p) return 'public/global_vector_store.json';
   const blobMatch = p.match(/^https?:\/\/github\.com\/[^/]+\/[^/]+\/(?:blob|raw)\/[^/]+\/(.+)$/i);
   if (blobMatch) p = blobMatch[1];
   const rawMatch = p.match(/^https?:\/\/raw\.githubusercontent\.com\/[^/]+\/[^/]+\/[^/]+\/(.+)$/i);
   if (rawMatch) p = rawMatch[1];
-  return p.replace(/^[./]+/, '') || 'public/global_vector_store.json';
+  p = p.replace(/^[./]+/, '').replace(/\/+$/, '');
+  if (branch && p.startsWith(`${branch}/`) && p.length > branch.length + 1) {
+    p = p.slice(branch.length + 1);
+  }
+  if (!p) return 'public/global_vector_store.json';
+  if (!/\.json$/i.test(p)) {
+    p = `${p}/global_vector_store.json`;
+  }
+  return p;
 }
 
 function getServerGithubConfig(overrides?: { owner?: string; repo?: string; branch?: string; filePath?: string; token?: string }) {
@@ -118,12 +160,13 @@ function getServerGithubConfig(overrides?: { owner?: string; repo?: string; bran
   const parsedOverride = overrides?.repo && (overrides.repo.includes('/') || overrides.repo.includes('github.'))
     ? parseGithubRepoString(overrides.repo, parsedEnv.owner, parsedEnv.repo)
     : null;
+  const resolvedBranch = (overrides?.branch || process.env.GITHUB_BRANCH || 'main').trim() || 'main';
 
   return {
     owner: (parsedOverride?.owner || overrides?.owner || parsedEnv.owner || 'dpxtd-ai').trim(),
     repo: (parsedOverride?.repo || overrides?.repo || parsedEnv.repo || 'genie_ai').trim(),
-    branch: (overrides?.branch || process.env.GITHUB_BRANCH || 'main').trim() || 'main',
-    filePath: normalizeGithubStorePath(overrides?.filePath || process.env.GITHUB_STORE_PATH),
+    branch: resolvedBranch,
+    filePath: normalizeGithubStorePath(overrides?.filePath || process.env.GITHUB_STORE_PATH, resolvedBranch),
     token: (overrides?.token || process.env.GITHUB_TOKEN || '').trim()
   };
 }
@@ -132,7 +175,7 @@ function validateGithubParams(cfg: { owner: string; repo: string; branch: string
   if (!cfg.owner || !VALID_GH_SEGMENT_RE.test(cfg.owner)) return 'Invalid GitHub owner.';
   if (!cfg.repo || !VALID_GH_SEGMENT_RE.test(cfg.repo)) return 'Invalid GitHub repository.';
   if (!cfg.branch || !VALID_GH_BRANCH_RE.test(cfg.branch) || cfg.branch.includes('..')) return 'Invalid GitHub branch.';
-  const cleanPath = normalizeGithubStorePath(cfg.filePath);
+  const cleanPath = normalizeGithubStorePath(cfg.filePath, cfg.branch);
   if (!cleanPath || cleanPath.includes('..') || !/^[a-zA-Z0-9._/-]+\.json$/.test(cleanPath)) {
     return 'Invalid repository JSON file path.';
   }
@@ -1334,8 +1377,13 @@ app.delete(['/api/documents/:id', '/api/v1/documents/:id'], async (req: Request,
     if (chunk.documentId === id) chunksDatabase.delete(chunkId);
   }
   persistVectorStoreToFile();
-  await syncCurrentStoreToGithub('force-delete', [id], undefined, `chore(vector-store): force delete document ${id}`).catch(() => null);
-  res.status(204).send();
+  const ghSync = await syncCurrentStoreToGithub(
+    'force-delete',
+    [id],
+    undefined,
+    `chore(vector-store): force delete document ${id}`
+  ).catch((err: any) => ({ synced: false, message: err?.message || 'GitHub sync skipped' }));
+  res.json({ success: true, githubSync: ghSync });
 });
 
 // Seed Samples (Cleaned for production deployment)

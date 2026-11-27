@@ -502,14 +502,18 @@ function computeWordSimilarity(w1: string, w2: string): number {
 }
 
 const STOP_WORDS = new Set([
-  'what', 'is', 'are', 'was', 'were', 'the', 'a', 'an', 'in', 'on', 'at', 'by',
-  'for', 'with', 'about', 'against', 'between', 'into', 'through', 'during',
-  'before', 'after', 'above', 'below', 'to', 'from', 'up', 'down', 'of', 'off',
-  'over', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when',
-  'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most',
-  'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so',
-  'than', 'too', 'very', 'can', 'will', 'just', 'should', 'now', 'tell', 'me',
-  'give', 'explain', 'describe', 'define', 'please'
+  'what', 'who', 'whom', 'whose', 'which', 'is', 'are', 'was', 'were', 'am',
+  'be', 'been', 'being', 'the', 'a', 'an', 'in', 'on', 'at', 'by', 'for',
+  'with', 'about', 'against', 'between', 'into', 'through', 'during', 'before',
+  'after', 'above', 'below', 'to', 'from', 'up', 'down', 'of', 'off', 'over',
+  'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where',
+  'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other',
+  'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than',
+  'too', 'very', 'can', 'will', 'just', 'should', 'now', 'tell', 'me', 'my',
+  'mine', 'you', 'your', 'yours', 'yourself', 'we', 'our', 'ours', 'us', 'they',
+  'their', 'theirs', 'them', 'he', 'him', 'his', 'she', 'her', 'hers', 'it',
+  'its', 'itself', 'this', 'that', 'these', 'those', 'do', 'does', 'did',
+  'done', 'have', 'has', 'had', 'give', 'explain', 'describe', 'define', 'please'
 ]);
 
 function scoreChunkRelevance(
@@ -795,12 +799,69 @@ app.get(['/health', '/api/v1/health'], (req: Request, res: Response) => {
 
 // Multi-model fallback chain to handle rate limits and availability gracefully
 const CANDIDATE_LLM_MODELS = [
+  'gemini-4-hydrogen',
+  'gemini-3.1-flash-lite',
   'gemini-3.5-flash',
   'gemini-3.6-flash',
-  'gemini-3.7-flash',
-  'gemini-3.1-flash-lite',
   'gemini-3.8-flash'
 ];
+
+function synthesizeReadableAnswerFromChunks(
+  chunks: Array<{ documentTitle?: string; title?: string; chunkIndex: number; content: string }>
+): string {
+  if (!chunks || chunks.length === 0) return '';
+
+  const seenNormalized: string[] = [];
+  const uniqueSentences: Array<{ text: string; citation: string }> = [];
+
+  for (const chunk of chunks) {
+    const title = chunk.documentTitle || chunk.title || 'Document';
+    const citation = `[Doc: ${title} #${chunk.chunkIndex}]`;
+    const sentences = chunk.content
+      .replace(/\s+/g, ' ')
+      .trim()
+      .split(/(?<=[.?!])\s+/)
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+
+    for (let idx = 0; idx < sentences.length; idx++) {
+      const sentence = sentences[idx];
+      const norm = sentence.toLowerCase().replace(/\s+/g, ' ').trim();
+      if (!norm) continue;
+
+      if (idx === 0 && chunk.chunkIndex > 0 && /^[a-z]/.test(sentence)) {
+        const isContained = seenNormalized.some(prev => prev.includes(norm) || prev.endsWith(norm));
+        if (isContained) continue;
+        const headSlice = norm.slice(0, Math.min(40, norm.length));
+        if (headSlice.length >= 15 && seenNormalized.some(prev => prev.includes(headSlice))) {
+          continue;
+        }
+      }
+
+      const duplicate = seenNormalized.some(prev => prev === norm || prev.includes(norm));
+      if (duplicate) continue;
+
+      seenNormalized.push(norm);
+      uniqueSentences.push({ text: sentence, citation });
+    }
+  }
+
+  if (uniqueSentences.length === 0) {
+    const first = chunks[0];
+    const title = first.documentTitle || first.title || 'Document';
+    return `${first.content.trim()} [Doc: ${title} #${first.chunkIndex}]`;
+  }
+
+  const lead = `${uniqueSentences[0].text} ${uniqueSentences[0].citation}`;
+  if (uniqueSentences.length === 1) return lead;
+
+  const bullets = uniqueSentences
+    .slice(1)
+    .map(item => `- ${item.text} ${item.citation}`)
+    .join('\n');
+
+  return `${lead}\n\n### Key Details from Knowledge Base\n${bullets}`;
+}
 
 let lastLlmErrorDetails: string | null = null;
 
@@ -957,9 +1018,10 @@ app.post(['/api/rag/query', '/api/v1/rag/query'], async (req: Request, res: Resp
 
     const cosineScore = cosineSimilarity(queryEmbedding, chunk.embedding);
     const relevanceScore = scoreChunkRelevance(question, chunk);
-    const combinedScore = Math.max(cosineScore, relevanceScore);
+    const effectiveCosine = cosineScore >= 0.45 ? cosineScore : 0;
+    const combinedScore = Math.max(effectiveCosine, relevanceScore);
 
-    if (combinedScore >= 0.25) {
+    if (combinedScore >= 0.30) {
       matchedChunks.push({
         ...chunk,
         similarityScore: Math.round(combinedScore * 1000) / 1000
@@ -969,8 +1031,21 @@ app.post(['/api/rag/query', '/api/v1/rag/query'], async (req: Request, res: Resp
 
   matchedChunks.sort((a, b) => b.similarityScore - a.similarityScore);
 
-  // Collect relevant chunks, prioritizing matched documents and ordering by chunkIndex
-  const matchedDocIds = new Set(matchedChunks.slice(0, 3).map(c => c.documentId));
+  const docMaxScore = new Map<string, number>();
+  for (const c of matchedChunks) {
+    docMaxScore.set(c.documentId, Math.max(docMaxScore.get(c.documentId) || 0, c.similarityScore));
+  }
+  const topDocScore = Array.from(docMaxScore.values()).reduce((max, s) => Math.max(max, s), 0);
+  const docThreshold = Math.max(0.30, topDocScore * 0.72);
+
+  // Collect chunks only from winning documents so unrelated docs never leak in
+  const matchedDocIds = new Set(
+    Array.from(docMaxScore.entries())
+      .filter(([, score]) => score >= docThreshold)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 2)
+      .map(([docId]) => docId)
+  );
   const expandedChunks: Array<StoredChunk & { similarityScore: number }> = [];
 
   for (const chunk of chunksDatabase.values()) {
@@ -978,15 +1053,17 @@ app.post(['/api/rag/query', '/api/v1/rag/query'], async (req: Request, res: Resp
       const matchItem = matchedChunks.find(m => m.id === chunk.id);
       expandedChunks.push({
         ...chunk,
-        similarityScore: matchItem ? matchItem.similarityScore : 0.75
+        similarityScore: matchItem ? matchItem.similarityScore : (docMaxScore.get(chunk.documentId) || 0.75)
       });
     }
   }
 
-  // Sort by document and chunkIndex so the AI reads coherent full document context
+  // Sort by winning document rank and chunkIndex so the AI reads coherent context
   expandedChunks.sort((a, b) => {
+    const docScoreDiff = (docMaxScore.get(b.documentId) || 0) - (docMaxScore.get(a.documentId) || 0);
+    if (Math.abs(docScoreDiff) > 0.001) return docScoreDiff;
     if (a.documentId === b.documentId) return a.chunkIndex - b.chunkIndex;
-    return b.similarityScore - a.similarityScore;
+    return a.documentId.localeCompare(b.documentId);
   });
 
   const relevantChunks = (expandedChunks.length > 0 ? expandedChunks : matchedChunks).slice(0, 6);
@@ -1004,22 +1081,18 @@ app.post(['/api/rag/query', '/api/v1/rag/query'], async (req: Request, res: Resp
   let systemInstruction = '';
 
   if (contextFound) {
-    systemInstruction = `You are Genie, a principal software engineer and enterprise AI architect.
-Your objective is to provide a complete, comprehensive, authoritative, and production-grade answer to the user's question.
+    systemInstruction = `You are Genie, a principal software engineer and enterprise AI assistant.
+Your objective is to provide a clear, complete, well-structured, and authoritative answer grounded strictly in the retrieved context.
 
 CRITICAL QUALITY STANDARDS:
 1. CONTEXT GROUNDING & CITATIONS:
    - Ground your answer thoroughly in the provided document context chunks.
-   - Cite the sources inline with [Doc: <Title> #<Index>] when referencing concepts, classes, pros/cons, or statements from them.
-2. COMPLETENESS & DEPTH (NO SHALLOW OR TRUNCATED ANSWERS):
-   - When explaining technical concepts, provide an in-depth explanation covering what it is, core mechanics (e.g., how metadata and IL interact at runtime), key namespaces and classes (e.g., Type, MethodInfo, PropertyInfo, Activator), and practical code snippets.
-   - When asked for "Pros and Cons" or advantages/disadvantages, you MUST provide an exhaustive, high-detail breakdown of BOTH:
-     * Advantages: Detailed points explaining flexibility, dynamic discovery, automation, extensibility/plugins.
-     * Disadvantages: Detailed points explaining performance overhead, lack of compile-time type safety, security/encapsulation risks, and refactoring fragility.
-   - NEVER leave any section, bullet list, or heading empty, incomplete, or abruptly ended.
-3. STRUCTURE & CODE:
-   - Format with clear Markdown headings (###), bold terms, clean bullet points, and realistic C# code examples.
-   - Provide clean, professional developer documentation quality.`;
+   - Cite the sources inline with [Doc: <Title> #<Index>] when referencing statements, profiles, concepts, or pros/cons from them.
+2. COMPLETENESS & STRUCTURE:
+   - Start with a direct, natural answer to the user's question.
+   - Organize supporting details under clear Markdown headings (###) and concise bullet points with bold key terms.
+   - When asked for "Pros and Cons" or technical implementation details, include thorough explanations and include code examples only when relevant to the question/context.
+   - NEVER leave any section or bullet incomplete or include unrelated documents.`;
 
     promptToSend = `=== RETRIEVED KNOWLEDGE BASE CONTEXT ===
 ${relevantChunks.map(c => `--- [Doc: ${c.documentTitle} #${c.chunkIndex}] (Similarity: ${c.similarityScore}, Dept: ${c.department}) ---\n${c.content}\n`).join('\n')}
@@ -1027,7 +1100,7 @@ ${relevantChunks.map(c => `--- [Doc: ${c.documentTitle} #${c.chunkIndex}] (Simil
 === USER QUESTION ===
 ${question}
 
-Please answer the user's question thoroughly and professionally according to the quality standards above, with citations to the retrieved chunks.`;
+Please answer the user's question thoroughly and cleanly according to the quality standards above, with inline [Doc: <Title> #<Index>] citations.`;
   } else {
     // REQUIREMENT #7: If no context found with vector search then same input text send to llm.
     systemInstruction = `You are Genie, a principal software engineer and knowledgeable assistant. 
@@ -1042,7 +1115,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
       contents: promptToSend,
       config: {
         systemInstruction,
-        temperature: contextFound ? 0.2 : 0.7,
+        temperature: contextFound ? 0.1 : 0.7,
       }
     },
     requestApiKey
@@ -1051,8 +1124,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
   if (generated) {
     answerText = generated;
   } else if (contextFound && relevantChunks.length > 0) {
-    const top = relevantChunks[0];
-    answerText = `Based on retrieved document [Doc: ${top.documentTitle} #${top.chunkIndex}], here is the relevant excerpt:\n\n${top.content}`;
+    answerText = synthesizeReadableAnswerFromChunks(relevantChunks);
   } else {
     answerText = formatDirectLlmFallbackResponse(question, lastLlmErrorDetails);
   }

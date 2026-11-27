@@ -50,7 +50,8 @@ import {
   normalizeDoc,
   normalizeChunk,
   normalizeBackendUrl,
-  buildApiUrl
+  buildApiUrl,
+  synthesizeReadableAnswerFromChunks
 } from './githubStore';
 
 // Configure marked for GitHub-Flavored Markdown
@@ -157,14 +158,18 @@ function computeWordSimilarity(w1: string, w2: string): number {
 }
 
 const STOP_WORDS = new Set([
-  'what', 'is', 'are', 'was', 'were', 'the', 'a', 'an', 'in', 'on', 'at', 'by',
-  'for', 'with', 'about', 'against', 'between', 'into', 'through', 'during',
-  'before', 'after', 'above', 'below', 'to', 'from', 'up', 'down', 'of', 'off',
-  'over', 'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when',
-  'where', 'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most',
-  'other', 'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so',
-  'than', 'too', 'very', 'can', 'will', 'just', 'should', 'now', 'tell', 'me',
-  'give', 'explain', 'describe', 'define', 'please'
+  'what', 'who', 'whom', 'whose', 'which', 'is', 'are', 'was', 'were', 'am',
+  'be', 'been', 'being', 'the', 'a', 'an', 'in', 'on', 'at', 'by', 'for',
+  'with', 'about', 'against', 'between', 'into', 'through', 'during', 'before',
+  'after', 'above', 'below', 'to', 'from', 'up', 'down', 'of', 'off', 'over',
+  'under', 'again', 'further', 'then', 'once', 'here', 'there', 'when', 'where',
+  'why', 'how', 'all', 'any', 'both', 'each', 'few', 'more', 'most', 'other',
+  'some', 'such', 'no', 'nor', 'not', 'only', 'own', 'same', 'so', 'than',
+  'too', 'very', 'can', 'will', 'just', 'should', 'now', 'tell', 'me', 'my',
+  'mine', 'you', 'your', 'yours', 'yourself', 'we', 'our', 'ours', 'us', 'they',
+  'their', 'theirs', 'them', 'he', 'him', 'his', 'she', 'her', 'hers', 'it',
+  'its', 'itself', 'this', 'that', 'these', 'those', 'do', 'does', 'did',
+  'done', 'have', 'has', 'had', 'give', 'explain', 'describe', 'define', 'please'
 ]);
 
 function scoreChunkRelevance(
@@ -338,12 +343,14 @@ export default function App() {
   const callGeminiDirectlyFromBrowser = async (
     apiKey: string,
     prompt: string,
-    systemInstruction?: string
+    systemInstruction?: string,
+    temperature = 0.15
   ): Promise<string> => {
     const models = [
+      'gemini-4-hydrogen',
+      'gemini-3.1-flash-lite',
       'gemini-3.6-flash',
       'gemini-3.8-flash',
-      'gemini-3.1-flash-lite',
       'gemini-flash-latest'
     ];
 
@@ -360,7 +367,7 @@ export default function App() {
             }
           ],
           generationConfig: {
-            temperature: 0.25,
+            temperature,
             maxOutputTokens: 4096
           }
         };
@@ -1326,22 +1333,36 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
       return { ...chunk, score, matchedWords };
     });
 
-    const maxMatch = scoredChunks.reduce((max, c) => Math.max(max, c.score), 0);
+    const docMaxScore = new Map<string, number>();
+    for (const c of scoredChunks) {
+      docMaxScore.set(c.docId, Math.max(docMaxScore.get(c.docId) || 0, c.score));
+    }
 
-    // Step 3: Check if vector / file context matched
-    const contextFound = maxMatch >= 0.20;
+    const topDocScore = Array.from(docMaxScore.values()).reduce((max, s) => Math.max(max, s), 0);
+
+    // Step 3: Check if vector / file context matched (require solid relevance, block weak noise)
+    const contextFound = topDocScore >= 0.30;
     let answerText = '';
 
     if (contextFound) {
-      // Find documents with matched chunks
-      const matchedDocIds = new Set(scoredChunks.filter(c => c.score >= 0.20).map(c => c.docId));
+      // Keep only documents close to the top matching document so unrelated docs never leak in
+      const docThreshold = Math.max(0.30, topDocScore * 0.72);
+      const matchedDocIds = new Set(
+        Array.from(docMaxScore.entries())
+          .filter(([, score]) => score >= docThreshold)
+          .sort((a, b) => b[1] - a[1])
+          .slice(0, 2)
+          .map(([docId]) => docId)
+      );
 
-      // Retrieve all relevant chunks from the matched document(s), ordered logically by chunkIndex
+      // Retrieve all chunks from the winning matched document(s), ordered by doc rank then chunkIndex
       const retrievedChunks = scoredChunks
-        .filter(c => c.score >= 0.15 || matchedDocIds.has(c.docId))
+        .filter(c => matchedDocIds.has(c.docId))
         .sort((a, b) => {
+          const docScoreDiff = (docMaxScore.get(b.docId) || 0) - (docMaxScore.get(a.docId) || 0);
+          if (Math.abs(docScoreDiff) > 0.001) return docScoreDiff;
           if (a.docId === b.docId) return a.chunkIndex - b.chunkIndex;
-          return b.score - a.score;
+          return a.docId.localeCompare(b.docId);
         })
         .slice(0, 6);
 
@@ -1351,22 +1372,18 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
 
       if (customApiKey) {
         try {
-          const systemPrompt = `You are Genie, a principal software engineer and enterprise AI architect.
-Your objective is to provide a complete, comprehensive, authoritative, and production-grade answer to the user's question.
+          const systemPrompt = `You are Genie, a principal software engineer and enterprise AI assistant.
+Your objective is to provide a clear, complete, well-structured, and authoritative answer grounded strictly in the retrieved context.
 
 CRITICAL QUALITY STANDARDS:
 1. CONTEXT GROUNDING & CITATIONS:
    - Ground your answer thoroughly in the provided document context chunks.
-   - Cite the sources inline with [Doc: <Title> #<Index>] when referencing concepts, classes, pros/cons, or statements from them.
-2. COMPLETENESS & DEPTH (NO SHALLOW OR TRUNCATED ANSWERS):
-   - When explaining technical concepts, provide an in-depth explanation covering what it is, core mechanics (e.g., how metadata and IL interact at runtime), key namespaces and classes (e.g., Type, MethodInfo, PropertyInfo, Activator), and practical code snippets.
-   - When asked for "Pros and Cons" or advantages/disadvantages, you MUST provide an exhaustive, high-detail breakdown of BOTH:
-     * Advantages: Detailed points explaining flexibility, dynamic discovery, automation, extensibility/plugins.
-     * Disadvantages: Detailed points explaining performance overhead, lack of compile-time type safety, security/encapsulation risks, and refactoring fragility.
-   - NEVER leave any section, bullet list, or heading empty, incomplete, or abruptly ended.
-3. STRUCTURE & CODE:
-   - Format with clear Markdown headings (###), bold terms, clean bullet points, and realistic C# code examples.
-   - Provide clean, professional developer documentation quality.`;
+   - Cite the sources inline with [Doc: <Title> #<Index>] when referencing statements, profiles, concepts, or pros/cons from them.
+2. COMPLETENESS & STRUCTURE:
+   - Start with a direct, natural answer to the user's question.
+   - Organize supporting details under clear Markdown headings (###) and concise bullet points with bold key terms.
+   - When asked for "Pros and Cons" or technical implementation details, include thorough explanations and include code examples only when relevant to the question/context.
+   - NEVER leave any section or bullet incomplete or include unrelated documents.`;
 
           const promptToSend = `=== RETRIEVED KNOWLEDGE BASE CONTEXT ===
 ${contextBlock}
@@ -1374,15 +1391,15 @@ ${contextBlock}
 === USER QUESTION ===
 ${questionText}
 
-Please answer the user's question thoroughly and professionally according to the quality standards above, with citations to the retrieved chunks.`;
+Please answer the user's question thoroughly and cleanly according to the quality standards above, with inline [Doc: <Title> #<Index>] citations.`;
 
-          const llmResponse = await callGeminiDirectlyFromBrowser(customApiKey, promptToSend, systemPrompt);
-          answerText = llmResponse || retrievedChunks.map(c => `### [Doc: ${c.title} #${c.chunkIndex}]\n\n${c.content}`).join('\n\n---\n\n');
+          const llmResponse = await callGeminiDirectlyFromBrowser(customApiKey, promptToSend, systemPrompt, 0.1);
+          answerText = llmResponse || synthesizeReadableAnswerFromChunks(retrievedChunks);
         } catch {
-          answerText = retrievedChunks.map(c => `### [Doc: ${c.title} #${c.chunkIndex}]\n\n${c.content}`).join('\n\n---\n\n');
+          answerText = synthesizeReadableAnswerFromChunks(retrievedChunks);
         }
       } else {
-        answerText = retrievedChunks.map(c => `### [Doc: ${c.title} #${c.chunkIndex}]\n\n${c.content}`).join('\n\n---\n\n');
+        answerText = synthesizeReadableAnswerFromChunks(retrievedChunks);
       }
 
       setChatMessages((prev) => [

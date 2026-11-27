@@ -670,3 +670,65 @@ export async function testGithubConnection(
     };
   }
 }
+
+export function synthesizeReadableAnswerFromChunks(
+  chunks: Array<{ title?: string; documentTitle?: string; chunkIndex: number; content: string }>
+): string {
+  if (!chunks || chunks.length === 0) return '';
+
+  const seenNormalized: string[] = [];
+  const uniqueSentences: Array<{ text: string; citation: string }> = [];
+
+  for (const chunk of chunks) {
+    const title = chunk.title || chunk.documentTitle || 'Document';
+    const citation = `[Doc: ${title} #${chunk.chunkIndex}]`;
+    const sentences = chunk.content
+      .replace(/\s+/g, ' ')
+      .trim()
+      .split(/(?<=[.?!])\s+/)
+      .map(s => s.trim())
+      .filter(s => s.length > 0);
+
+    for (let idx = 0; idx < sentences.length; idx++) {
+      const sentence = sentences[idx];
+      const norm = sentence.toLowerCase().replace(/\s+/g, ' ').trim();
+      if (!norm) continue;
+
+      // Skip overlapping mid-sentence tail fragments from chunking overlap
+      if (idx === 0 && chunk.chunkIndex > 0 && /^[a-z]/.test(sentence)) {
+        const isContained = seenNormalized.some(prev => prev.includes(norm) || prev.endsWith(norm));
+        if (isContained) continue;
+        // Even if partial, check if last ~40 chars already appeared at end of previous sentence
+        const headSlice = norm.slice(0, Math.min(40, norm.length));
+        if (headSlice.length >= 15 && seenNormalized.some(prev => prev.includes(headSlice))) {
+          continue;
+        }
+      }
+
+      const duplicate = seenNormalized.some(prev => prev === norm || prev.includes(norm));
+      if (duplicate) continue;
+
+      seenNormalized.push(norm);
+      uniqueSentences.push({ text: sentence, citation });
+    }
+  }
+
+  if (uniqueSentences.length === 0) {
+    const first = chunks[0];
+    const title = first.title || first.documentTitle || 'Document';
+    return `${first.content.trim()} [Doc: ${title} #${first.chunkIndex}]`;
+  }
+
+  const lead = `${uniqueSentences[0].text} ${uniqueSentences[0].citation}`;
+  if (uniqueSentences.length === 1) {
+    return lead;
+  }
+
+  const bullets = uniqueSentences
+    .slice(1)
+    .map(item => `- ${item.text} ${item.citation}`)
+    .join('\n');
+
+  return `${lead}\n\n### Key Details from Knowledge Base\n${bullets}`;
+}
+

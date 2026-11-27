@@ -66,46 +66,353 @@ const documentsDatabase = new Map<string, StoredDoc>();
 const chunksDatabase = new Map<string, StoredChunk>();
 
 const DATA_DIR = path.resolve(process.cwd(), 'data');
-const STORE_FILE = path.join(DATA_DIR, 'vector_store.json');
+const PUBLIC_DIR = path.resolve(process.cwd(), 'public');
+const STORE_FILE = path.resolve(DATA_DIR, 'vector_store.json');
+const GLOBAL_PUBLIC_STORE_FILE = path.resolve(PUBLIC_DIR, 'global_vector_store.json');
+
+const VALID_GH_SEGMENT_RE = /^[a-zA-Z0-9._-]+$/;
+const VALID_GH_BRANCH_RE = /^[a-zA-Z0-9._/-]+$/;
+
+function parseGithubRepoString(rawRepo?: string, fallbackOwner = 'dpxtd-ai', fallbackRepo = 'genie_ai'): { owner: string; repo: string } {
+  const input = (rawRepo || '').trim();
+  if (!input) return { owner: fallbackOwner, repo: fallbackRepo };
+
+  const ghUrlMatch = input.match(/^https?:\/\/(?:www\.)?github\.com\/([^/\s]+)\/([^/\s?#]+?)(?:\.git)?(?:[/?#].*)?$/i);
+  if (ghUrlMatch) {
+    return { owner: ghUrlMatch[1].trim(), repo: ghUrlMatch[2].trim() };
+  }
+
+  const sshMatch = input.match(/^git@github\.com:([^/\s]+)\/([^/\s]+?)(?:\.git)?$/i);
+  if (sshMatch) {
+    return { owner: sshMatch[1].trim(), repo: sshMatch[2].trim() };
+  }
+
+  const pagesMatch = input.match(/^https?:\/\/([a-zA-Z0-9-]+)\.github\.io\/([^/\s?#]+)/i);
+  if (pagesMatch) {
+    return { owner: pagesMatch[1].trim(), repo: pagesMatch[2].trim() };
+  }
+
+  const cleaned = input.replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '');
+  if (cleaned.includes('/')) {
+    const parts = cleaned.split('/').filter(Boolean);
+    if (parts.length >= 2) {
+      return { owner: parts[0].trim(), repo: parts[1].trim() };
+    }
+  }
+
+  return { owner: fallbackOwner, repo: cleaned || fallbackRepo };
+}
+
+function normalizeGithubStorePath(rawPath?: string): string {
+  let p = (rawPath || '').trim();
+  if (!p) return 'public/global_vector_store.json';
+  const blobMatch = p.match(/^https?:\/\/github\.com\/[^/]+\/[^/]+\/(?:blob|raw)\/[^/]+\/(.+)$/i);
+  if (blobMatch) p = blobMatch[1];
+  const rawMatch = p.match(/^https?:\/\/raw\.githubusercontent\.com\/[^/]+\/[^/]+\/[^/]+\/(.+)$/i);
+  if (rawMatch) p = rawMatch[1];
+  return p.replace(/^[./]+/, '') || 'public/global_vector_store.json';
+}
+
+function getServerGithubConfig(overrides?: { owner?: string; repo?: string; branch?: string; filePath?: string; token?: string }) {
+  const parsedEnv = parseGithubRepoString(process.env.GITHUB_REPO, 'dpxtd-ai', 'genie_ai');
+  const parsedOverride = overrides?.repo && (overrides.repo.includes('/') || overrides.repo.includes('github.'))
+    ? parseGithubRepoString(overrides.repo, parsedEnv.owner, parsedEnv.repo)
+    : null;
+
+  return {
+    owner: (parsedOverride?.owner || overrides?.owner || parsedEnv.owner || 'dpxtd-ai').trim(),
+    repo: (parsedOverride?.repo || overrides?.repo || parsedEnv.repo || 'genie_ai').trim(),
+    branch: (overrides?.branch || process.env.GITHUB_BRANCH || 'main').trim() || 'main',
+    filePath: normalizeGithubStorePath(overrides?.filePath || process.env.GITHUB_STORE_PATH),
+    token: (overrides?.token || process.env.GITHUB_TOKEN || '').trim()
+  };
+}
+
+function validateGithubParams(cfg: { owner: string; repo: string; branch: string; filePath: string }): string | null {
+  if (!cfg.owner || !VALID_GH_SEGMENT_RE.test(cfg.owner)) return 'Invalid GitHub owner.';
+  if (!cfg.repo || !VALID_GH_SEGMENT_RE.test(cfg.repo)) return 'Invalid GitHub repository.';
+  if (!cfg.branch || !VALID_GH_BRANCH_RE.test(cfg.branch) || cfg.branch.includes('..')) return 'Invalid GitHub branch.';
+  const cleanPath = normalizeGithubStorePath(cfg.filePath);
+  if (!cleanPath || cleanPath.includes('..') || !/^[a-zA-Z0-9._/-]+\.json$/.test(cleanPath)) {
+    return 'Invalid repository JSON file path.';
+  }
+  return null;
+}
+
+function normalizeStorePayload() {
+  const docs = Array.from(documentsDatabase.values()).map(d => ({
+    ...d,
+    syncedToGithub: true
+  }));
+  const chunks = Array.from(chunksDatabase.values()).map(c => ({
+    id: c.id,
+    docId: c.documentId,
+    documentId: c.documentId,
+    title: c.documentTitle,
+    documentTitle: c.documentTitle,
+    chunkIndex: c.chunkIndex,
+    content: c.content,
+    department: c.department,
+    requiredSecurityRole: c.requiredSecurityRole,
+    tokenCount: c.tokenCount,
+    embedding: Array.isArray(c.embedding)
+      ? c.embedding.map(v => Math.round(v * 100000) / 100000)
+      : []
+  }));
+  return {
+    version: 1,
+    updatedAt: new Date().toISOString(),
+    documents: docs,
+    chunks
+  };
+}
 
 function persistVectorStoreToFile() {
   try {
+    if (!STORE_FILE.startsWith(DATA_DIR + path.sep) || !GLOBAL_PUBLIC_STORE_FILE.startsWith(PUBLIC_DIR + path.sep)) {
+      throw new Error('Store path outside allowed directory.');
+    }
     if (!fs.existsSync(DATA_DIR)) {
       fs.mkdirSync(DATA_DIR, { recursive: true });
     }
-    const data = {
-      documents: Array.from(documentsDatabase.values()),
-      chunks: Array.from(chunksDatabase.values())
-    };
+    if (!fs.existsSync(PUBLIC_DIR)) {
+      fs.mkdirSync(PUBLIC_DIR, { recursive: true });
+    }
+    const data = normalizeStorePayload();
     fs.writeFileSync(STORE_FILE, JSON.stringify(data, null, 2), 'utf-8');
+    fs.writeFileSync(GLOBAL_PUBLIC_STORE_FILE, JSON.stringify(data), 'utf-8');
   } catch (err) {
     console.warn('Failed to persist vector store to file:', err);
+  }
+}
+
+function ingestStoreJsonIntoMemory(content: string) {
+  const data = JSON.parse(content);
+  if (Array.isArray(data.documents)) {
+    for (const doc of data.documents) {
+      if (doc && doc.id && !documentsDatabase.has(doc.id)) {
+        documentsDatabase.set(doc.id, {
+          id: String(doc.id),
+          title: String(doc.title || 'Untitled'),
+          fileName: String(doc.fileName || `${doc.title || 'document'}.txt`),
+          department: String(doc.department || 'General'),
+          requiredSecurityRole: String(doc.requiredSecurityRole || 'Public'),
+          characterCount: Number(doc.characterCount || 0),
+          estimatedTokens: Number(doc.estimatedTokens || 0),
+          createdAt: String(doc.createdAt || new Date().toISOString()),
+          chunksCount: Number(doc.chunksCount || 0)
+        });
+      }
+    }
+  }
+  if (Array.isArray(data.chunks)) {
+    for (const chunk of data.chunks) {
+      if (chunk && chunk.id && !chunksDatabase.has(chunk.id)) {
+        const docId = String(chunk.documentId || chunk.docId || '');
+        const docTitle = String(chunk.documentTitle || chunk.title || 'Untitled');
+        const chunkContent = String(chunk.content || '');
+        const embedding = Array.isArray(chunk.embedding) && chunk.embedding.length > 0
+          ? chunk.embedding
+          : generateDeterministicVector(chunkContent, 768);
+        chunksDatabase.set(chunk.id, {
+          id: String(chunk.id),
+          documentId: docId,
+          documentTitle: docTitle,
+          chunkIndex: Number(chunk.chunkIndex ?? 0),
+          content: chunkContent,
+          department: String(chunk.department || 'General'),
+          requiredSecurityRole: String(chunk.requiredSecurityRole || 'Public'),
+          embedding,
+          tokenCount: Number(chunk.tokenCount || Math.ceil(chunkContent.length / 4))
+        });
+      }
+    }
   }
 }
 
 function loadVectorStoreFromFile() {
   try {
     if (fs.existsSync(STORE_FILE)) {
-      const content = fs.readFileSync(STORE_FILE, 'utf-8');
-      const data = JSON.parse(content);
-      if (Array.isArray(data.documents)) {
-        for (const doc of data.documents) {
-          documentsDatabase.set(doc.id, doc);
-        }
-      }
-      if (Array.isArray(data.chunks)) {
-        for (const chunk of data.chunks) {
-          chunksDatabase.set(chunk.id, chunk);
-        }
-      }
-      console.log(`Loaded ${documentsDatabase.size} documents and ${chunksDatabase.size} chunks from local file store.`);
+      ingestStoreJsonIntoMemory(fs.readFileSync(STORE_FILE, 'utf-8'));
     }
+    if (fs.existsSync(GLOBAL_PUBLIC_STORE_FILE)) {
+      ingestStoreJsonIntoMemory(fs.readFileSync(GLOBAL_PUBLIC_STORE_FILE, 'utf-8'));
+    }
+    console.log(`Loaded ${documentsDatabase.size} documents and ${chunksDatabase.size} chunks from local & global file stores.`);
   } catch (err) {
     console.warn('Failed to load vector store from file:', err);
   }
 }
 
 loadVectorStoreFromFile();
+
+async function pullStoreFromGithubIntoMemory(replaceWithRemote = false): Promise<boolean> {
+  const cfg = getServerGithubConfig();
+  if (validateGithubParams(cfg)) return false;
+
+  const encodedPath = cfg.filePath.split('/').map(seg => encodeURIComponent(seg)).join('/');
+  const contentsUrl = `https://api.github.com/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}/contents/${encodedPath}?ref=${encodeURIComponent(cfg.branch)}&_t=${Date.now()}`;
+
+  try {
+    const headers: Record<string, string> = {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'genie-rag-studio'
+    };
+    if (cfg.token) headers.Authorization = `Bearer ${cfg.token}`;
+
+    const resp = await fetch(contentsUrl, {
+      headers,
+      signal: AbortSignal.timeout(4000)
+    });
+    if (!resp.ok) return false;
+
+    const json: any = await resp.json();
+    let parsed: any = null;
+    if (typeof json.content === 'string' && json.content.trim().length > 0) {
+      parsed = JSON.parse(Buffer.from(json.content, 'base64').toString('utf-8'));
+    } else if (json.download_url && String(json.download_url).startsWith('https://raw.githubusercontent.com/')) {
+      const rawHeaders: Record<string, string> = { 'User-Agent': 'genie-rag-studio' };
+      if (cfg.token) rawHeaders.Authorization = `Bearer ${cfg.token}`;
+      const rawResp = await fetch(json.download_url, { headers: rawHeaders, signal: AbortSignal.timeout(4000) });
+      if (rawResp.ok) parsed = await rawResp.json();
+    }
+
+    if (!parsed || !Array.isArray(parsed.documents) || !Array.isArray(parsed.chunks)) {
+      return false;
+    }
+
+    if (replaceWithRemote) {
+      documentsDatabase.clear();
+      chunksDatabase.clear();
+    }
+    ingestStoreJsonIntoMemory(JSON.stringify(parsed));
+    persistVectorStoreToFile();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function syncCurrentStoreToGithub(
+  mode: 'merge' | 'force-delete' | 'force-delete-all',
+  targetDocIds: string[] = [],
+  overrides?: { owner?: string; repo?: string; branch?: string; filePath?: string; token?: string },
+  commitMessage?: string
+): Promise<{ synced: boolean; message: string; documentsCount?: number; chunksCount?: number }> {
+  const cfg = getServerGithubConfig(overrides);
+  const validationErr = validateGithubParams(cfg);
+  if (validationErr) {
+    return { synced: false, message: validationErr };
+  }
+  if (!cfg.token) {
+    return { synced: false, message: 'No GITHUB_TOKEN configured.' };
+  }
+
+  const encodedPath = cfg.filePath.split('/').map(seg => encodeURIComponent(seg)).join('/');
+  const contentsUrl = `https://api.github.com/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}/contents/${encodedPath}`;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const getResp = await fetch(`${contentsUrl}?ref=${encodeURIComponent(cfg.branch)}&_t=${Date.now()}`, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${cfg.token}`,
+        'User-Agent': 'genie-rag-studio'
+      }
+    });
+
+    let sha: string | undefined;
+    let remoteDocs: any[] = [];
+    let remoteChunks: any[] = [];
+
+    if (getResp.ok) {
+      const json: any = await getResp.json();
+      sha = json.sha;
+      let parsed: any = null;
+      if (typeof json.content === 'string' && json.content.trim().length > 0) {
+        parsed = JSON.parse(Buffer.from(json.content, 'base64').toString('utf-8'));
+      } else if (json.download_url && String(json.download_url).startsWith('https://raw.githubusercontent.com/')) {
+        const rawResp = await fetch(json.download_url, {
+          headers: { Authorization: `Bearer ${cfg.token}`, 'User-Agent': 'genie-rag-studio' }
+        });
+        if (rawResp.ok) parsed = await rawResp.json();
+      }
+      if (parsed) {
+        remoteDocs = Array.isArray(parsed.documents) ? parsed.documents : [];
+        remoteChunks = Array.isArray(parsed.chunks) ? parsed.chunks : [];
+      }
+    } else if (getResp.status !== 404) {
+      const errJson: any = await getResp.json().catch(() => ({}));
+      return { synced: false, message: errJson.message || `GitHub GET failed (${getResp.status})` };
+    }
+
+    const localPayload = normalizeStorePayload();
+    let finalDocs: any[] = [];
+    let finalChunks: any[] = [];
+
+    if (mode === 'force-delete-all') {
+      finalDocs = [];
+      finalChunks = [];
+    } else if (mode === 'force-delete') {
+      const removeSet = new Set(targetDocIds);
+      finalDocs = remoteDocs.filter(d => !removeSet.has(String(d.id)));
+      finalChunks = remoteChunks.filter(c => !removeSet.has(String(c.docId || c.documentId || '')));
+    } else {
+      const docMap = new Map<string, any>();
+      for (const d of remoteDocs) docMap.set(String(d.id), { ...d, syncedToGithub: true });
+      for (const d of localPayload.documents) docMap.set(String(d.id), { ...d, syncedToGithub: true });
+
+      const chunkMap = new Map<string, any>();
+      for (const c of remoteChunks) chunkMap.set(String(c.id), c);
+      for (const c of localPayload.chunks) chunkMap.set(String(c.id), c);
+
+      finalDocs = Array.from(docMap.values());
+      finalChunks = Array.from(chunkMap.values());
+    }
+
+    const nextJson = JSON.stringify({
+      version: 1,
+      updatedAt: new Date().toISOString(),
+      documents: finalDocs,
+      chunks: finalChunks
+    }, null, 2);
+
+    const putBody: Record<string, any> = {
+      message: commitMessage || `chore(vector-store): sync global chunk store (${finalDocs.length} docs)`,
+      content: Buffer.from(nextJson, 'utf-8').toString('base64'),
+      branch: cfg.branch
+    };
+    if (sha) putBody.sha = sha;
+
+    const putResp = await fetch(contentsUrl, {
+      method: 'PUT',
+      headers: {
+        Accept: 'application/vnd.github+json',
+        Authorization: `Bearer ${cfg.token}`,
+        'Content-Type': 'application/json',
+        'User-Agent': 'genie-rag-studio'
+      },
+      body: JSON.stringify(putBody)
+    });
+
+    if (putResp.ok) {
+      return {
+        synced: true,
+        message: 'Global chunk store synced to GitHub repository.',
+        documentsCount: finalDocs.length,
+        chunksCount: finalChunks.length
+      };
+    }
+
+    if (putResp.status === 409 && attempt < 2) {
+      continue;
+    }
+
+    const errJson: any = await putResp.json().catch(() => ({}));
+    return { synced: false, message: errJson.message || `GitHub PUT failed (${putResp.status})` };
+  }
+
+  return { synced: false, message: 'GitHub sync conflicted after retries.' };
+}
 
 // Helper: Cosine Similarity
 function cosineSimilarity(a: number[], b: number[]): number {
@@ -343,12 +650,92 @@ function createChunks(cleanedText: string, docId: string, title: string, departm
 // API Routes matching ASP.NET Core & Studio
 // ==========================================
 
-// Clear All Documents (for clean deployment & reset)
-app.post(['/api/documents/clear-all', '/api/v1/documents/clear-all'], (req: Request, res: Response) => {
+// Force Clear All Documents (explicit force delete only)
+app.post(['/api/documents/clear-all', '/api/v1/documents/clear-all'], async (req: Request, res: Response) => {
   documentsDatabase.clear();
   chunksDatabase.clear();
   persistVectorStoreToFile();
-  res.json({ success: true, message: 'All documents and vector embeddings have been cleared.' });
+  const ghSync = await syncCurrentStoreToGithub('force-delete-all', [], undefined, 'chore(vector-store): force delete all documents').catch(
+    (err: any) => ({ synced: false, message: err?.message || 'GitHub sync skipped' })
+  );
+  res.json({
+    success: true,
+    message: 'All documents and vector embeddings have been force-deleted.',
+    githubSync: ghSync
+  });
+});
+
+// Global Store Read Endpoint (hydrates from GitHub + returns normalized documents + chunks for cross-device sync)
+app.get(['/api/global-store', '/api/v1/global-store'], async (req: Request, res: Response) => {
+  const cfg = getServerGithubConfig();
+  const pulledLive = await pullStoreFromGithubIntoMemory(true);
+  const payload = normalizeStorePayload();
+  res.json({
+    ...payload,
+    githubConfigured: Boolean(cfg.token),
+    githubOwner: cfg.owner,
+    githubRepoName: cfg.repo,
+    githubRepo: `${cfg.owner}/${cfg.repo}`,
+    githubBranch: cfg.branch,
+    githubStorePath: cfg.filePath,
+    githubLiveReachable: pulledLive
+  });
+});
+
+// Test GitHub Repository Connection (validates repo, branch & token without logging secrets)
+app.post(['/api/github/test', '/api/v1/github/test'], async (req: Request, res: Response) => {
+  const { owner, repo, branch, filePath, token } = req.body || {};
+  const cfg = getServerGithubConfig({ owner, repo, branch, filePath, token });
+  const err = validateGithubParams(cfg);
+  if (err) {
+    return res.status(400).json({ ok: false, canPush: false, message: err });
+  }
+
+  try {
+    const headers: Record<string, string> = {
+      Accept: 'application/vnd.github+json',
+      'User-Agent': 'genie-rag-studio'
+    };
+    if (cfg.token) headers.Authorization = `Bearer ${cfg.token}`;
+
+    const repoResp = await fetch(`https://api.github.com/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}`, {
+      headers
+    });
+    if (!repoResp.ok) {
+      const errJson: any = await repoResp.json().catch(() => ({}));
+      return res.json({ ok: false, canPush: false, message: errJson.message || `GitHub HTTP ${repoResp.status}` });
+    }
+    const repoData: any = await repoResp.json();
+    const canPush = Boolean(repoData.permissions?.push);
+
+    const encodedPath = cfg.filePath.split('/').map(seg => encodeURIComponent(seg)).join('/');
+    const fileResp = await fetch(
+      `https://api.github.com/repos/${encodeURIComponent(cfg.owner)}/${encodeURIComponent(cfg.repo)}/contents/${encodedPath}?ref=${encodeURIComponent(cfg.branch)}`,
+      { headers }
+    );
+    const fileStatus = fileResp.ok ? `file "${cfg.filePath}" found on branch "${cfg.branch}"` : `file "${cfg.filePath}" will be created on first upload to branch "${cfg.branch}"`;
+
+    res.json({
+      ok: true,
+      canPush,
+      message: canPush
+        ? `Authenticated with write access to ${repoData.full_name} (${fileStatus}).`
+        : `Connected to ${repoData.full_name} in read-only mode (${fileStatus}). Add a token with Contents: Read & Write permission to push uploads.`
+    });
+  } catch (e: any) {
+    res.status(500).json({ ok: false, canPush: false, message: e?.message || 'GitHub connection error' });
+  }
+});
+
+// Manual / On-demand Server GitHub Sync
+app.post(['/api/github/sync', '/api/v1/github/sync'], async (req: Request, res: Response) => {
+  const { owner, repo, branch, filePath, token, documents: extraDocs, chunks: extraChunks } = req.body || {};
+  if (Array.isArray(extraDocs) || Array.isArray(extraChunks)) {
+    ingestStoreJsonIntoMemory(JSON.stringify({ documents: extraDocs || [], chunks: extraChunks || [] }));
+    persistVectorStoreToFile();
+  }
+  const result = await syncCurrentStoreToGithub('merge', [], { owner, repo, branch, filePath, token });
+  res.status(result.synced ? 200 : 400).json(result);
 });
 
 // Health Check
@@ -828,6 +1215,12 @@ app.post(['/api/documents/upload-file', '/api/v1/documents/upload-file'], async 
 
     documentsDatabase.set(docId, docEntry);
     persistVectorStoreToFile();
+    const ghSync = await syncCurrentStoreToGithub(
+      'merge',
+      [],
+      undefined,
+      `chore(vector-store): upload chunks for ${fileName}`
+    ).catch((err: any) => ({ synced: false, message: err?.message || 'GitHub sync skipped' }));
 
     res.json({
       success: true,
@@ -837,7 +1230,8 @@ app.post(['/api/documents/upload-file', '/api/v1/documents/upload-file'], async 
       chunksCreated: chunks.length,
       totalTokens: chunks.reduce((acc, c) => acc + c.tokenCount, 0),
       cleanedLength: cleaned.length,
-      preview: cleaned.slice(0, 200) + '...'
+      preview: cleaned.slice(0, 200) + '...',
+      githubSync: ghSync
     });
   } catch (error: any) {
     console.error('File upload error:', error);
@@ -901,6 +1295,13 @@ app.post(['/api/documents/ingest', '/api/v1/documents/ingest'], async (req: Requ
   };
 
   documentsDatabase.set(docId, docEntry);
+  persistVectorStoreToFile();
+  const ghSync = await syncCurrentStoreToGithub(
+    'merge',
+    [],
+    undefined,
+    `chore(vector-store): ingest chunks for ${docEntry.fileName}`
+  ).catch((err: any) => ({ synced: false, message: err?.message || 'GitHub sync skipped' }));
 
   res.json({
     documentId: docId,
@@ -909,6 +1310,7 @@ app.post(['/api/documents/ingest', '/api/v1/documents/ingest'], async (req: Requ
     totalTokens: chunks.reduce((acc, c) => acc + c.tokenCount, 0),
     cleanedLength: cleaned.length,
     processingDuration: '0.12s',
+    githubSync: ghSync,
     sampleChunks: chunks.slice(0, 3).map(c => ({
       chunkId: c.id,
       index: c.chunkIndex,
@@ -924,14 +1326,15 @@ app.get(['/api/documents', '/api/v1/documents'], (req: Request, res: Response) =
   res.json(Array.from(documentsDatabase.values()));
 });
 
-// Delete Document
-app.delete(['/api/documents/:id', '/api/v1/documents/:id'], (req: Request, res: Response) => {
+// Force Delete Document
+app.delete(['/api/documents/:id', '/api/v1/documents/:id'], async (req: Request, res: Response) => {
   const { id } = req.params;
   documentsDatabase.delete(id);
   for (const [chunkId, chunk] of chunksDatabase.entries()) {
     if (chunk.documentId === id) chunksDatabase.delete(chunkId);
   }
   persistVectorStoreToFile();
+  await syncCurrentStoreToGithub('force-delete', [id], undefined, `chore(vector-store): force delete document ${id}`).catch(() => null);
   res.status(204).send();
 });
 
@@ -1048,6 +1451,11 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`RAG Platform server running on http://0.0.0.0:${PORT}`);
+    pullStoreFromGithubIntoMemory(true).then(ok => {
+      if (ok) {
+        console.log(`Synced global store from GitHub (${documentsDatabase.size} docs, ${chunksDatabase.size} chunks).`);
+      }
+    }).catch(() => null);
   });
 }
 

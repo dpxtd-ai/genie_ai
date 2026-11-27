@@ -167,13 +167,14 @@ docker exec -it rag-pgvector psql -U postgres -d ragdb -c "CREATE EXTENSION IF N
 docker exec -i rag-pgvector psql -U postgres -d ragdb < rag_llm/dotnet/src/RagLlm.Api/Database/schema_pgvector.sql
 ```
 
-### 5. Running on Static Hosting (GitHub Pages / In-Browser Mode)
+### 5. Global Cross-Device Storage on GitHub (`public/global_vector_store.json`)
 
-If deployed as a client-side static bundle (e.g., `https://dpxtd-ai.github.io/genie_ai/`):
-- All uploaded documents are automatically parsed and embedded in-browser.
-- Document and chunk data are saved to `localStorage` and will persist across browser refreshes.
-- You can export your vector database as a backup file (`genie_vector_store.json`) using the **Export Store** button and restore it on any machine using **Import Store**.
-- Enter your Gemini API key via the **AI Key** modal in the top navigation bar to enable live inference.
+To make uploaded documents and chunks permanently available across **all users and devices** (even on static GitHub Pages like `https://dpxtd-ai.github.io/genie_ai/`):
+- **Global Chunk File**: All ingested documents and chunks are stored in `public/global_vector_store.json` inside your GitHub repository (and mirrored to `./data/vector_store.json` when running the Node server).
+- **Zero-Auth Global Read**: Any user opening the app from any phone, laptop, or browser automatically fetches `public/global_vector_store.json` live from GitHub (`api.github.com` / `raw.githubusercontent.com` / bundled `./global_vector_store.json`) and can search all chunks immediately in AI Chat.
+- **Persistent Global Upload (Atomic Merge)**: Click **GitHub Sync** in the top navigation bar (or configure `GITHUB_TOKEN` in `.env` on the Node server) with a GitHub Fine-Grained Personal Access Token (`Contents: Read & Write` on `genie_ai`). Every upload atomically fetches the latest remote SHA, merges new chunks without overwriting existing files, and commits directly to GitHub.
+- **Force Delete Only**: Documents and chunks are **never** automatically wiped on refresh or new uploads. Removing a document requires explicit confirmation via the **Force Delete** dialog (and typing `FORCE DELETE ALL` for full store wipes).
+- **Offline / Backup**: Browser `localStorage` retains pending uploads, and **Export Store** / **Import Store** allow manual JSON backup anytime.
 
 ---
 
@@ -182,10 +183,13 @@ If deployed as a client-side static bundle (e.g., `https://dpxtd-ai.github.io/ge
 | Method | Endpoint | Description |
 |---|---|---|
 | `POST` | `/api/rag/query` | Executes RAG query: computes embeddings, performs similarity search, and calls Gemini LLM. |
-| `POST` | `/api/documents/upload-file` | Ingests PDF, CSV, TXT, or DOCX, chunks text, generates embeddings, and saves to file store. |
+| `POST` | `/api/documents/upload-file` | Ingests PDF, CSV, TXT, or DOCX, chunks text, generates embeddings, saves to file store, and syncs to GitHub if configured. |
 | `GET` | `/api/documents` | Lists all ingested documents with token count and chunk count. |
-| `DELETE` | `/api/documents/:id` | Removes document and all associated vector embeddings from store. |
-| `POST` | `/api/documents/clear-all` | Purges all documents and vector embeddings from storage. |
+| `GET` | `/api/global-store` | Returns normalized global documents and chunks plus GitHub sync metadata. |
+| `POST` | `/api/github/test` | Tests repository access and write permissions against the GitHub API. |
+| `POST` | `/api/github/sync` | Atomically merges local documents and chunks into the repository's `public/global_vector_store.json`. |
+| `DELETE` | `/api/documents/:id` | Force-deletes a document and its vector embeddings locally and on GitHub. |
+| `POST` | `/api/documents/clear-all` | Force-deletes all documents and vector embeddings from local and GitHub storage. |
 | `POST` | `/api/rag/search-only` | Performs vector search only without calling LLM (for pipeline debugging). |
 | `GET` | `/api/rag/download-zip` | Downloads the complete ASP.NET Core & Angular companion codebase as a ZIP archive. |
 | `POST` | `/api/gemini/validate-key` | Validates a user-supplied Gemini API key against model endpoints. |

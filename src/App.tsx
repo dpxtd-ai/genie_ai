@@ -33,15 +33,37 @@ import {
   Search,
   Tag,
   ChevronDown,
-  ChevronUp
+  ChevronUp,
+  Globe,
+  Cloud,
+  AlertTriangle
 } from 'lucide-react';
 import { INTERVIEW_QUESTIONS } from './interviewData';
+import {
+  GithubSyncConfig,
+  loadGithubSyncConfig,
+  saveGithubSyncConfig,
+  fetchGlobalStoreFromGithubOrStatic,
+  mergeDocumentsIntoGithub,
+  forceDeleteFromGithub,
+  testGithubConnection,
+  normalizeDoc,
+  normalizeChunk
+} from './githubStore';
 
 // Configure marked for GitHub-Flavored Markdown
 marked.setOptions({
   gfm: true,
   breaks: true,
 });
+
+function sanitizeRenderedHtml(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?>[\s\S]*?<\/script>/gi, '')
+    .replace(/<iframe[\s\S]*?>[\s\S]*?<\/iframe>/gi, '')
+    .replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, '')
+    .replace(/(href|src)\s*=\s*(["'])\s*javascript:[\s\S]*?\2/gi, '$1="#"');
+}
 
 function renderFormattedMarkdown(text: string): string {
   if (!text) return '';
@@ -52,7 +74,7 @@ function renderFormattedMarkdown(text: string): string {
   );
 
   try {
-    return marked.parse(withCitations) as string;
+    return sanitizeRenderedHtml(marked.parse(withCitations) as string);
   } catch (err) {
     console.error('Markdown parse error:', err);
     return text;
@@ -81,6 +103,7 @@ interface StoredDoc {
   estimatedTokens: number;
   createdAt: string;
   chunksCount: number;
+  syncedToGithub?: boolean;
 }
 
 interface CodeFileItem {
@@ -291,6 +314,19 @@ export default function App() {
   const [testingKey, setTestingKey] = useState(false);
   const [testResult, setTestResult] = useState<{ success?: boolean; message?: string } | null>(null);
 
+  // Global GitHub Sync & Force-Delete State
+  const [githubConfig, setGithubConfig] = useState<GithubSyncConfig>(() => loadGithubSyncConfig());
+  const [showGithubModal, setShowGithubModal] = useState(false);
+  const [ghDraft, setGhDraft] = useState<GithubSyncConfig>(() => loadGithubSyncConfig());
+  const [testingGithub, setTestingGithub] = useState(false);
+  const [githubTestResult, setGithubTestResult] = useState<{ ok: boolean; canPush: boolean; message: string } | null>(null);
+  const [isSyncingGithub, setIsSyncingGithub] = useState(false);
+  const [serverGithubConfigured, setServerGithubConfigured] = useState(false);
+  const [globalSourceLabel, setGlobalSourceLabel] = useState<'github-live' | 'static-bundle' | 'server' | 'local'>('local');
+  const [forceDeleteModal, setForceDeleteModal] = useState<{ mode: 'single'; doc: StoredDoc } | { mode: 'all' } | null>(null);
+  const [forceDeleteConfirmText, setForceDeleteConfirmText] = useState('');
+  const [isForceDeleting, setIsForceDeleting] = useState(false);
+
   // Direct Browser Gemini Caller (for Static GitHub Pages / Frontend Deployment)
   const callGeminiDirectlyFromBrowser = async (
     apiKey: string,
@@ -432,38 +468,113 @@ export default function App() {
     setTheme(prev => prev === 'dark' ? 'light' : 'dark');
   };
 
-  const fetchDocuments = async () => {
+  const fetchDocuments = async (overrideConfig?: GithubSyncConfig) => {
+    const activeGhConfig = overrideConfig || githubConfig;
+    let remoteDocs: StoredDoc[] = [];
+    let remoteChunks: ClientChunk[] = [];
+    let fetchedRemote = false;
+
+    // 1. Try full-stack backend global store first (when Node server is running)
     try {
-      const res = await fetch('/api/documents');
+      const res = await fetch(`/api/global-store?t=${Date.now()}`, { cache: 'no-store' });
       if (res.ok) {
         const data = await res.json();
-        if (Array.isArray(data) && data.length > 0) {
-          setDocuments(data);
-          return;
+        if (typeof data.githubConfigured === 'boolean') {
+          setServerGithubConfigured(data.githubConfigured);
+        }
+        if (!overrideConfig && data.githubOwner && data.githubRepoName) {
+          const syncedCfg: GithubSyncConfig = {
+            owner: data.githubOwner,
+            repo: data.githubRepoName,
+            branch: data.githubBranch || 'main',
+            filePath: data.githubStorePath || 'public/global_vector_store.json',
+            token: activeGhConfig.token
+          };
+          setGithubConfig(syncedCfg);
+          saveGithubSyncConfig(syncedCfg);
+        }
+        if (Array.isArray(data.documents) && Array.isArray(data.chunks)) {
+          remoteDocs = data.documents.map((d: any) => normalizeDoc(d, true));
+          remoteChunks = data.chunks.map(normalizeChunk);
+          fetchedRemote = true;
+          setGlobalSourceLabel(data.githubLiveReachable ? 'github-live' : 'server');
         }
       }
     } catch {
-      // Static hosting / GitHub Pages: rely on client-side state
+      // Static hosting / GitHub Pages
     }
 
-    // If backend did not return documents or is not connected, retain from localStorage!
+    // 2. Fetch live global store from GitHub (raw/API) or static bundled ./global_vector_store.json
+    if (!fetchedRemote || remoteDocs.length === 0) {
+      const ghRes = await fetchGlobalStoreFromGithubOrStatic(activeGhConfig);
+      if (ghRes) {
+        const remoteDocIds = new Set(remoteDocs.map(d => d.id));
+        for (const d of ghRes.store.documents) {
+          if (!remoteDocIds.has(d.id)) remoteDocs.push(normalizeDoc(d, true));
+        }
+        const remoteChunkIds = new Set(remoteChunks.map(c => c.id));
+        for (const c of ghRes.store.chunks) {
+          if (!remoteChunkIds.has(c.id)) remoteChunks.push(normalizeChunk(c));
+        }
+        fetchedRemote = true;
+        setGlobalSourceLabel(ghRes.source);
+      }
+    }
+
+    // 3. Preserve local unsynced documents from localStorage (never drop pending local uploads!)
+    let localDocs: StoredDoc[] = [];
+    let localChunks: ClientChunk[] = [];
     try {
       const savedDocs = localStorage.getItem('genie_stored_documents');
       if (savedDocs) {
         const parsed = JSON.parse(savedDocs);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setDocuments(parsed);
-        }
+        if (Array.isArray(parsed)) localDocs = parsed;
       }
       const savedChunks = localStorage.getItem('genie_stored_chunks');
       if (savedChunks) {
         const parsed = JSON.parse(savedChunks);
-        if (Array.isArray(parsed) && parsed.length > 0) {
-          setClientChunks(parsed);
-        }
+        if (Array.isArray(parsed)) localChunks = parsed;
       }
     } catch (err) {
       console.warn('Error reading from localStorage:', err);
+    }
+
+    // Merge remote global store + local pending docs (if remote fetch failed, keep ALL local docs!)
+    const mergedDocsMap = new Map<string, StoredDoc>();
+    for (const d of remoteDocs) {
+      mergedDocsMap.set(d.id, { ...d, syncedToGithub: true });
+    }
+    for (const d of localDocs) {
+      if (!fetchedRemote || d.syncedToGithub === false) {
+        if (!mergedDocsMap.has(d.id)) {
+          mergedDocsMap.set(d.id, d);
+        }
+      }
+    }
+
+    const activeDocIds = new Set(mergedDocsMap.keys());
+    const mergedChunksMap = new Map<string, ClientChunk>();
+    for (const c of remoteChunks) {
+      if (activeDocIds.has(c.docId)) mergedChunksMap.set(c.id, c);
+    }
+    for (const c of localChunks) {
+      const cDocId = c.docId || (c as any).documentId;
+      if (activeDocIds.has(cDocId) && !mergedChunksMap.has(c.id)) {
+        mergedChunksMap.set(c.id, normalizeChunk(c));
+      }
+    }
+
+    const finalDocs = Array.from(mergedDocsMap.values());
+    const finalChunks = Array.from(mergedChunksMap.values());
+
+    setDocuments(finalDocs);
+    setClientChunks(finalChunks);
+
+    try {
+      localStorage.setItem('genie_stored_documents', JSON.stringify(finalDocs));
+      localStorage.setItem('genie_stored_chunks', JSON.stringify(finalChunks));
+    } catch (err) {
+      console.warn('LocalStorage update error:', err);
     }
   };
 
@@ -669,10 +780,27 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
 
           if (res.ok) {
             const data = await res.json();
+            let syncMsg = '';
+            if (data.githubSync?.synced) {
+              syncMsg = ' Synced globally to GitHub repository for all devices.';
+            } else if (githubConfig.token) {
+              try {
+                const gsRes = await fetch('/api/global-store');
+                if (gsRes.ok) {
+                  const gsData = await gsRes.json();
+                  const docOnly = (gsData.documents || []).filter((d: any) => d.id === data.documentId).map((d: any) => normalizeDoc(d, true));
+                  const chunksOnly = (gsData.chunks || []).filter((c: any) => (c.docId || c.documentId) === data.documentId).map(normalizeChunk);
+                  await mergeDocumentsIntoGithub(githubConfig, docOnly, chunksOnly, `chore(vector-store): upload chunks for ${file.name}`);
+                  syncMsg = ' Synced globally to GitHub repository for all devices.';
+                }
+              } catch (ghErr: any) {
+                syncMsg = ` Saved on server, but GitHub global sync failed: ${ghErr.message}`;
+              }
+            }
             setUploadMessage({
-              text: `Successfully ingested "${file.name}"! Created ${data.chunksCreated} vector embeddings.`
+              text: `Successfully ingested "${file.name}"! Created ${data.chunksCreated} vector embeddings.${syncMsg}`
             });
-            fetchDocuments();
+            await fetchDocuments();
             return;
           }
         } catch {
@@ -739,8 +867,6 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
           });
         }
 
-        setClientChunks(prev => [...prev, ...newChunks]);
-
         const newDoc: StoredDoc = {
           id: docId,
           title,
@@ -749,22 +875,52 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
           characterCount: clean.length,
           estimatedTokens: Math.ceil(clean.length / 4),
           createdAt: new Date().toISOString(),
-          chunksCount: newChunks.length
+          chunksCount: newChunks.length,
+          syncedToGithub: false
         };
 
-        const updatedChunks = [...newChunks, ...clientChunks];
-        const updatedDocs = [newDoc, ...documents];
-        setClientChunks(updatedChunks);
-        setDocuments(updatedDocs);
-        try {
-          localStorage.setItem('genie_stored_chunks', JSON.stringify(updatedChunks));
-          localStorage.setItem('genie_stored_documents', JSON.stringify(updatedDocs));
-        } catch (e) {
-          console.warn('LocalStorage save error:', e);
+        // Push globally to GitHub repository if token is configured
+        let syncedGlobal = false;
+        let syncNote = '';
+        if (githubConfig.token) {
+          try {
+            const mergedRemote = await mergeDocumentsIntoGithub(
+              githubConfig,
+              [{ ...newDoc, syncedToGithub: true }],
+              newChunks.map(normalizeChunk),
+              `chore(vector-store): upload chunks for ${file.name}`
+            );
+            syncedGlobal = true;
+            setGlobalSourceLabel('github-live');
+            const remoteDocs = mergedRemote.documents.map(d => normalizeDoc(d, true));
+            const remoteChunks = mergedRemote.chunks.map(normalizeChunk);
+            setDocuments(remoteDocs);
+            setClientChunks(remoteChunks);
+            localStorage.setItem('genie_stored_documents', JSON.stringify(remoteDocs));
+            localStorage.setItem('genie_stored_chunks', JSON.stringify(remoteChunks));
+          } catch (ghErr: any) {
+            syncNote = ` GitHub global sync failed (${ghErr.message}). Saved locally—click "Push to GitHub" to retry.`;
+          }
+        }
+
+        if (!syncedGlobal) {
+          const updatedChunks = [...newChunks, ...clientChunks];
+          const updatedDocs = [newDoc, ...documents];
+          setClientChunks(updatedChunks);
+          setDocuments(updatedDocs);
+          try {
+            localStorage.setItem('genie_stored_chunks', JSON.stringify(updatedChunks));
+            localStorage.setItem('genie_stored_documents', JSON.stringify(updatedDocs));
+          } catch (e) {
+            console.warn('LocalStorage save error:', e);
+          }
         }
 
         setUploadMessage({
-          text: `Successfully ingested "${file.name}"! Created ${newChunks.length} vector chunks. Saved to local persistent file store.`
+          text: syncedGlobal
+            ? `Uploaded "${file.name}" (${newChunks.length} chunks) and committed permanently to GitHub (${githubConfig.owner}/${githubConfig.repo}/${githubConfig.filePath}). Accessible globally on all devices until force-deleted!`
+            : `Ingested "${file.name}" (${newChunks.length} chunks) locally.${syncNote || ' Configure your GitHub Token in "GitHub Sync" to store this file permanently on the GitHub server for all devices.'}`,
+          isError: Boolean(syncNote)
         });
       } catch (err: any) {
         setUploadMessage({ text: err.message || 'Error processing file', isError: true });
@@ -776,36 +932,142 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
     reader.readAsDataURL(file);
   };
 
-  const handleDeleteDocument = async (id: string) => {
-    try {
-      await fetch(`/api/documents/${id}`, { method: 'DELETE' });
-    } catch {
-      // Ignore network errors on static hosting
+  const handlePushAllToGithub = async (overrideCfg?: GithubSyncConfig) => {
+    const cfg = overrideCfg || githubConfig;
+    if (!cfg.token && !serverGithubConfigured) {
+      setGhDraft(cfg);
+      setShowGithubModal(true);
+      return;
     }
-    const updatedDocs = documents.filter(d => d.id !== id);
-    const updatedChunks = clientChunks.filter(c => c.docId !== id);
-    setDocuments(updatedDocs);
-    setClientChunks(updatedChunks);
+    setIsSyncingGithub(true);
+    setUploadMessage(null);
     try {
-      localStorage.setItem('genie_stored_documents', JSON.stringify(updatedDocs));
-      localStorage.setItem('genie_stored_chunks', JSON.stringify(updatedChunks));
-    } catch {}
+      // 1. Try server-side GitHub sync first (uses server GITHUB_TOKEN / GITHUB_REPO / GITHUB_BRANCH / GITHUB_STORE_PATH)
+      if (!cfg.token && serverGithubConfigured) {
+        const serverResp = await fetch('/api/github/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            owner: cfg.owner,
+            repo: cfg.repo,
+            branch: cfg.branch,
+            filePath: cfg.filePath,
+            documents,
+            chunks: clientChunks
+          })
+        });
+        const serverData = await serverResp.json();
+        if (!serverResp.ok || !serverData.synced) {
+          throw new Error(serverData.message || 'Server GitHub sync failed.');
+        }
+        await fetchDocuments(cfg);
+        setUploadMessage({
+          text: `Synced ${serverData.documentsCount ?? documents.length} document(s) & ${serverData.chunksCount ?? clientChunks.length} chunks to GitHub (${cfg.owner}/${cfg.repo} on branch "${cfg.branch}"). Globally accessible across all devices!`
+        });
+        return;
+      }
+
+      // 2. Direct browser GitHub sync (for GitHub Pages static hosting or custom browser token)
+      const merged = await mergeDocumentsIntoGithub(
+        cfg,
+        documents.map(d => normalizeDoc(d, true)),
+        clientChunks.map(normalizeChunk),
+        `chore(vector-store): sync ${documents.length} document(s) to global store`
+      );
+      const syncedDocs = merged.documents.map(d => normalizeDoc(d, true));
+      const syncedChunks = merged.chunks.map(normalizeChunk);
+      setDocuments(syncedDocs);
+      setClientChunks(syncedChunks);
+      setGlobalSourceLabel('github-live');
+      localStorage.setItem('genie_stored_documents', JSON.stringify(syncedDocs));
+      localStorage.setItem('genie_stored_chunks', JSON.stringify(syncedChunks));
+      setUploadMessage({
+        text: `Synced ${syncedDocs.length} document(s) & ${syncedChunks.length} chunks to GitHub (${cfg.owner}/${cfg.repo}/${cfg.filePath}). Globally accessible across all devices!`
+      });
+    } catch (err: any) {
+      setUploadMessage({
+        text: `GitHub sync failed: ${err?.message || String(err)}`,
+        isError: true
+      });
+    } finally {
+      setIsSyncingGithub(false);
+    }
   };
 
-  const handleClearAllDocs = async () => {
-    if (!confirm('Are you sure you want to clean all documents and vector embeddings?')) return;
-    try {
-      await fetch('/api/documents/clear-all', { method: 'POST' });
-    } catch {
-      // Static hosting
+  const executeForceDelete = async () => {
+    if (!forceDeleteModal) return;
+    if (forceDeleteModal.mode === 'all' && forceDeleteConfirmText.trim() !== 'FORCE DELETE ALL') {
+      return;
     }
-    setDocuments([]);
-    setClientChunks([]);
+
+    setIsForceDeleting(true);
     try {
-      localStorage.removeItem('genie_stored_documents');
-      localStorage.removeItem('genie_stored_chunks');
-    } catch {}
-    setUploadMessage({ text: 'Cleaned all vector store data. Ready for fresh deployment.' });
+      if (forceDeleteModal.mode === 'single') {
+        const targetId = forceDeleteModal.doc.id;
+        try {
+          await fetch(`/api/documents/${encodeURIComponent(targetId)}`, { method: 'DELETE' });
+        } catch {
+          // Ignore on static hosting
+        }
+
+        let ghNotice = '';
+        if (githubConfig.token && forceDeleteModal.doc.syncedToGithub !== false) {
+          try {
+            await forceDeleteFromGithub(
+              githubConfig,
+              [targetId],
+              `chore(vector-store): force delete ${forceDeleteModal.doc.fileName}`
+            );
+            ghNotice = ' Permanently removed from GitHub global store.';
+          } catch (ghErr: any) {
+            ghNotice = ` Note: GitHub remote deletion failed (${ghErr.message}).`;
+          }
+        }
+
+        const updatedDocs = documents.filter(d => d.id !== targetId);
+        const updatedChunks = clientChunks.filter(c => c.docId !== targetId);
+        setDocuments(updatedDocs);
+        setClientChunks(updatedChunks);
+        try {
+          localStorage.setItem('genie_stored_documents', JSON.stringify(updatedDocs));
+          localStorage.setItem('genie_stored_chunks', JSON.stringify(updatedChunks));
+        } catch {}
+
+        setUploadMessage({
+          text: `Force-deleted "${forceDeleteModal.doc.fileName}".${ghNotice}`
+        });
+      } else {
+        try {
+          await fetch('/api/documents/clear-all', { method: 'POST' });
+        } catch {
+          // Ignore on static hosting
+        }
+
+        let ghNotice = '';
+        if (githubConfig.token) {
+          try {
+            await forceDeleteFromGithub(githubConfig, 'ALL', 'chore(vector-store): force delete all global documents');
+            ghNotice = ' Global GitHub chunk store cleared.';
+          } catch (ghErr: any) {
+            ghNotice = ` Note: GitHub global clear failed (${ghErr.message}).`;
+          }
+        }
+
+        setDocuments([]);
+        setClientChunks([]);
+        try {
+          localStorage.removeItem('genie_stored_documents');
+          localStorage.removeItem('genie_stored_chunks');
+        } catch {}
+        setUploadMessage({
+          text: `Force-deleted all documents and vector chunks.${ghNotice}`
+        });
+      }
+    } finally {
+      setIsForceDeleting(false);
+      setForceDeleteModal(null);
+      setForceDeleteConfirmText('');
+    }
   };
 
   // Export & Backup Stored Vector Knowledge Base to a JSON file
@@ -1102,6 +1364,24 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
               {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
             </button>
 
+            {/* GitHub Global Store Sync Button */}
+            <button
+              onClick={() => {
+                setGhDraft(githubConfig);
+                setGithubTestResult(null);
+                setShowGithubModal(true);
+              }}
+              className={`px-2.5 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 transition-colors border ${
+                githubConfig.token || serverGithubConfigured
+                  ? 'bg-sky-500/10 text-sky-400 border-sky-500/30 hover:bg-sky-500/20'
+                  : isDark ? 'bg-slate-900 hover:bg-slate-800 text-slate-300 border-slate-800' : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200 shadow-xs'
+              }`}
+              title="Configure Global GitHub Chunk Storage">
+              <Globe className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">GitHub Sync</span>
+              {(githubConfig.token || serverGithubConfigured) && <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />}
+            </button>
+
             {/* AI Key Configuration Button */}
             <button
               onClick={() => {
@@ -1152,6 +1432,27 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
                 </div>
 
                 <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    onClick={() => fetchDocuments()}
+                    className={`px-3 py-1.5 border rounded-lg text-xs flex items-center gap-1.5 transition-colors ${isDark ? 'bg-slate-800 hover:bg-slate-700 text-sky-300 border-sky-500/30' : 'bg-sky-50 hover:bg-sky-100 text-sky-700 border-sky-200'}`}
+                    title="Fetch latest global chunks from GitHub server">
+                    <RefreshCw className="w-3.5 h-3.5 text-sky-400" />
+                    <span>Sync Global</span>
+                  </button>
+
+                  <button
+                    onClick={() => handlePushAllToGithub()}
+                    disabled={isSyncingGithub || documents.length === 0}
+                    className={`px-3 py-1.5 border rounded-lg text-xs flex items-center gap-1.5 transition-colors disabled:opacity-50 ${
+                      githubConfig.token || serverGithubConfigured
+                        ? isDark ? 'bg-emerald-950/60 hover:bg-emerald-900/60 text-emerald-300 border-emerald-700/70' : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-700 border-emerald-200'
+                        : isDark ? 'bg-slate-800 hover:bg-slate-700 text-amber-300 border-amber-500/30' : 'bg-amber-50 hover:bg-amber-100 text-amber-700 border-amber-200'
+                    }`}
+                    title="Commit local chunked documents permanently to GitHub repository">
+                    <Cloud className="w-3.5 h-3.5" />
+                    <span>{isSyncingGithub ? 'Pushing...' : 'Push to GitHub'}</span>
+                  </button>
+
                   <input
                     type="file"
                     ref={jsonInputRef}
@@ -1178,14 +1479,59 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
                       </button>
 
                       <button
-                        onClick={handleClearAllDocs}
+                        onClick={() => {
+                          setForceDeleteConfirmText('');
+                          setForceDeleteModal({ mode: 'all' });
+                        }}
                         className={`px-3 py-1.5 border rounded-lg text-xs flex items-center gap-1.5 transition-colors ${isDark ? 'bg-rose-950/60 hover:bg-rose-900/60 text-rose-300 border-rose-800/80' : 'bg-rose-50 hover:bg-rose-100 text-rose-700 border-rose-200'}`}>
                         <Trash2 className="w-3.5 h-3.5 text-rose-500" />
-                        <span>Clean All Data</span>
+                        <span>Force Delete All</span>
                       </button>
                     </>
                   )}
                 </div>
+              </div>
+
+              {/* Global GitHub Storage Status Banner */}
+              <div className={`mb-4 p-3 rounded-xl border text-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2 ${
+                githubConfig.token || serverGithubConfigured
+                  ? isDark ? 'bg-sky-950/30 border-sky-800/60 text-sky-200' : 'bg-sky-50 border-sky-200 text-sky-800'
+                  : isDark ? 'bg-slate-950/60 border-slate-800 text-slate-300' : 'bg-slate-50 border-slate-200 text-slate-700'
+              }`}>
+                <div className="flex items-start sm:items-center gap-2">
+                  <Globe className={`w-4 h-4 shrink-0 mt-0.5 sm:mt-0 ${githubConfig.token || serverGithubConfigured ? 'text-sky-400' : 'text-amber-400'}`} />
+                  <div>
+                    <span className="font-semibold">Global GitHub Chunk Store: </span>
+                    <span className="font-mono text-[11px]">{githubConfig.owner}/{githubConfig.repo}/{githubConfig.filePath}</span>
+                    <span className="ml-2 text-[11px] opacity-80">
+                      ({globalSourceLabel === 'github-live'
+                        ? 'Live Global Read Active'
+                        : globalSourceLabel === 'server'
+                        ? 'Server + Global Store Active'
+                        : globalSourceLabel === 'static-bundle'
+                        ? 'Static Bundle Read Active'
+                        : 'Local Browser Store'}
+                      {serverGithubConfigured
+                        ? ` • Server Token Active (branch: ${githubConfig.branch})`
+                        : githubConfig.token
+                        ? ` • Browser Auto-Push Enabled (branch: ${githubConfig.branch})`
+                        : ' • Read-Only until Token Added'})
+                    </span>
+                  </div>
+                </div>
+                <button
+                  onClick={() => {
+                    setGhDraft(githubConfig);
+                    setGithubTestResult(null);
+                    setShowGithubModal(true);
+                  }}
+                  className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold shrink-0 border transition-colors ${
+                    githubConfig.token || serverGithubConfigured
+                      ? isDark ? 'bg-sky-900/40 hover:bg-sky-800/50 border-sky-700 text-sky-200' : 'bg-white hover:bg-sky-100 border-sky-300 text-sky-700'
+                      : 'bg-indigo-600 hover:bg-indigo-500 border-indigo-600 text-white'
+                  }`}>
+                  {githubConfig.token || serverGithubConfigured ? 'Configure GitHub Sync' : 'Enable Global GitHub Upload'}
+                </button>
               </div>
 
               {/* Drag & Drop Zone */}
@@ -1233,10 +1579,10 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
 
                   <div>
                     <div className="text-sm font-semibold">
-                      {isUploading ? 'Extracting, chunking & embedding document...' : 'Click to select or drag and drop a document'}
+                      {isUploading ? 'Extracting, chunking & syncing document globally...' : 'Click to select or drag and drop a document'}
                     </div>
                     <div className={`text-xs mt-1 ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-                      Supports PDF (.pdf), CSV (.csv), Plain Text (.txt), Word (.docx)
+                      Supports PDF (.pdf), CSV (.csv), Plain Text (.txt), Word (.docx) • Retained permanently until Force Delete
                     </div>
                   </div>
                 </div>
@@ -1268,7 +1614,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
                   <span>Ingested Vector Documents ({documents.length})</span>
                 </h3>
                 <span className={`text-xs ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
-                  Ready for similarity search in the AI Chat tab
+                  Protected — never deleted until you Force Delete
                 </span>
               </div>
 
@@ -1279,22 +1625,36 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
               ) : (
                 <div className={`divide-y ${isDark ? 'divide-slate-800/80' : 'divide-slate-100'}`}>
                   {documents.map((doc) => (
-                    <div key={doc.id} className="py-3 flex justify-between items-center text-xs">
-                      <div>
-                        <div className={`font-semibold ${isDark ? 'text-slate-100' : 'text-slate-800'}`}>{doc.title}</div>
-                        <div className={`text-[11px] font-mono mt-0.5 ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>
+                    <div key={doc.id} className="py-3 flex justify-between items-center text-xs gap-3">
+                      <div className="min-w-0">
+                        <div className={`font-semibold flex items-center gap-2 flex-wrap ${isDark ? 'text-slate-100' : 'text-slate-800'}`}>
+                          <span>{doc.title}</span>
+                          {doc.syncedToGithub ? (
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono border ${isDark ? 'bg-sky-950/60 text-sky-300 border-sky-800/70' : 'bg-sky-50 text-sky-700 border-sky-200'}`}>
+                              Global GitHub
+                            </span>
+                          ) : (
+                            <span className={`px-1.5 py-0.5 rounded text-[10px] font-mono border ${isDark ? 'bg-amber-950/60 text-amber-300 border-amber-800/70' : 'bg-amber-50 text-amber-700 border-amber-200'}`}>
+                              Local Pending Sync
+                            </span>
+                          )}
+                        </div>
+                        <div className={`text-[11px] font-mono mt-0.5 truncate ${isDark ? 'text-slate-500' : 'text-slate-400'}`}>
                           {doc.fileName} • {doc.chunksCount} chunks • ~{doc.estimatedTokens} tokens
                         </div>
                       </div>
 
-                      <div className="flex items-center gap-3">
+                      <div className="flex items-center gap-3 shrink-0">
                         <span className={`px-2 py-0.5 font-mono text-[10px] rounded border ${isDark ? 'bg-slate-800 text-slate-300 border-slate-700' : 'bg-slate-100 text-slate-700 border-slate-200'}`}>
                           {doc.department}
                         </span>
                         <button
-                          onClick={() => handleDeleteDocument(doc.id)}
+                          onClick={() => {
+                            setForceDeleteConfirmText('');
+                            setForceDeleteModal({ mode: 'single', doc });
+                          }}
                           className={`p-1.5 rounded transition-colors ${isDark ? 'text-rose-400 hover:text-rose-300 hover:bg-rose-950/40' : 'text-rose-600 hover:text-rose-700 hover:bg-rose-50'}`}
-                          title="Delete from Vector Store">
+                          title="Force Delete from Global Vector Store">
                           <Trash2 className="w-3.5 h-3.5" />
                         </button>
                       </div>
@@ -1967,6 +2327,229 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
                 }}
                 className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-indigo-600 text-white hover:bg-indigo-500 shadow-md shadow-indigo-600/20">
                 Save Key
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* GitHub Global Store Configuration Modal */}
+      {showGithubModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+          <div className={`w-full max-w-lg rounded-2xl border p-6 shadow-2xl flex flex-col gap-4 ${isDark ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200 text-slate-900'}`}>
+            <div className="flex items-center justify-between pb-3 border-b border-slate-800/20">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-lg bg-sky-600/15 text-sky-400 flex items-center justify-center">
+                  <Globe className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm">Global GitHub Chunk Store Settings</h3>
+                  <p className="text-xs text-slate-400">Persist chunked uploads on GitHub so all users &amp; devices access them</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setShowGithubModal(false)}
+                className="text-slate-400 hover:text-slate-200 text-sm font-semibold p-1">
+                ✕
+              </button>
+            </div>
+
+            <div className="grid grid-cols-2 gap-3 text-xs">
+              <div>
+                <label className="font-semibold block mb-1 text-slate-300">GitHub Owner</label>
+                <input
+                  type="text"
+                  value={ghDraft.owner}
+                  onChange={(e) => setGhDraft({ ...ghDraft, owner: e.target.value })}
+                  placeholder="dpxtd-ai"
+                  className={`w-full px-3 py-2 text-xs font-mono rounded-xl border focus:outline-none focus:ring-2 focus:ring-sky-500 ${isDark ? 'bg-slate-950 border-slate-800 text-white' : 'bg-slate-50 border-slate-300 text-slate-900'}`}
+                />
+              </div>
+              <div>
+                <label className="font-semibold block mb-1 text-slate-300">Repository</label>
+                <input
+                  type="text"
+                  value={ghDraft.repo}
+                  onChange={(e) => setGhDraft({ ...ghDraft, repo: e.target.value })}
+                  placeholder="genie_ai"
+                  className={`w-full px-3 py-2 text-xs font-mono rounded-xl border focus:outline-none focus:ring-2 focus:ring-sky-500 ${isDark ? 'bg-slate-950 border-slate-800 text-white' : 'bg-slate-50 border-slate-300 text-slate-900'}`}
+                />
+              </div>
+              <div>
+                <label className="font-semibold block mb-1 text-slate-300">Branch</label>
+                <input
+                  type="text"
+                  value={ghDraft.branch}
+                  onChange={(e) => setGhDraft({ ...ghDraft, branch: e.target.value })}
+                  placeholder="main"
+                  className={`w-full px-3 py-2 text-xs font-mono rounded-xl border focus:outline-none focus:ring-2 focus:ring-sky-500 ${isDark ? 'bg-slate-950 border-slate-800 text-white' : 'bg-slate-50 border-slate-300 text-slate-900'}`}
+                />
+              </div>
+              <div>
+                <label className="font-semibold block mb-1 text-slate-300">Global Chunk File Path</label>
+                <input
+                  type="text"
+                  value={ghDraft.filePath}
+                  onChange={(e) => setGhDraft({ ...ghDraft, filePath: e.target.value })}
+                  placeholder="public/global_vector_store.json"
+                  className={`w-full px-3 py-2 text-xs font-mono rounded-xl border focus:outline-none focus:ring-2 focus:ring-sky-500 ${isDark ? 'bg-slate-950 border-slate-800 text-white' : 'bg-slate-50 border-slate-300 text-slate-900'}`}
+                />
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="text-xs font-semibold text-slate-300 block">
+                GitHub Fine-Grained Personal Access Token (Write Access)
+              </label>
+              <input
+                type="password"
+                placeholder="github_pat_... or ghp_..."
+                value={ghDraft.token}
+                onChange={(e) => setGhDraft({ ...ghDraft, token: e.target.value })}
+                className={`w-full px-3 py-2 text-xs font-mono rounded-xl border focus:outline-none focus:ring-2 focus:ring-sky-500 ${
+                  isDark ? 'bg-slate-950 border-slate-800 text-white' : 'bg-slate-50 border-slate-300 text-slate-900'
+                }`}
+              />
+              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                <span>
+                  {serverGithubConfigured && !ghDraft.token
+                    ? 'Server GITHUB_TOKEN is active. Leave blank to use server secret.'
+                    : <>Readers on other devices need NO token. Uploaders need <code className="text-sky-400">Contents: Read &amp; Write</code>.</>}
+                </span>
+                <div className="flex items-center gap-2 shrink-0">
+                  <button
+                    onClick={async () => {
+                      setTestingGithub(true);
+                      setGithubTestResult(null);
+                      try {
+                        const apiRes = await fetch('/api/github/test', {
+                          method: 'POST',
+                          headers: { 'Content-Type': 'application/json' },
+                          body: JSON.stringify(ghDraft)
+                        });
+                        if (apiRes.ok) {
+                          const data = await apiRes.json();
+                          setGithubTestResult(data);
+                          setTestingGithub(false);
+                          return;
+                        }
+                      } catch {
+                        // Static hosting fallback
+                      }
+                      const res = await testGithubConnection(ghDraft);
+                      setGithubTestResult(res);
+                      setTestingGithub(false);
+                    }}
+                    disabled={testingGithub}
+                    className="px-2.5 py-1 rounded-lg text-[11px] font-medium bg-slate-800 hover:bg-slate-700 text-sky-300 border border-sky-500/30 disabled:opacity-50">
+                    {testingGithub ? 'Testing...' : 'Test Repo'}
+                  </button>
+                  {ghDraft.token && (
+                    <button
+                      onClick={() => setGhDraft({ ...ghDraft, token: '' })}
+                      className="text-rose-400 hover:text-rose-300">
+                      Clear
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {githubTestResult && (
+                <div className={`p-3 rounded-xl border text-xs ${
+                  githubTestResult.ok
+                    ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+                    : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+                }`}>
+                  {githubTestResult.message}
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-800/20">
+              <button
+                onClick={() => setShowGithubModal(false)}
+                className={`px-3 py-1.5 rounded-xl text-xs font-medium ${isDark ? 'bg-slate-800 text-slate-300 hover:bg-slate-700' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}>
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  const normalized = saveGithubSyncConfig(ghDraft);
+                  setGithubConfig(normalized);
+                  setShowGithubModal(false);
+                  await fetchDocuments(normalized);
+                }}
+                className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-sky-600 text-white hover:bg-sky-500 shadow-md shadow-sky-600/20">
+                Save &amp; Sync
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Force Delete Confirmation Modal (Prevents Accidental Data Loss) */}
+      {forceDeleteModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs">
+          <div className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl flex flex-col gap-4 ${isDark ? 'bg-slate-900 border-rose-900/60 text-white' : 'bg-white border-rose-200 text-slate-900'}`}>
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-rose-500/15 text-rose-400 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="font-bold text-sm">
+                  {forceDeleteModal.mode === 'all' ? 'Force Delete All Global Vector Data?' : 'Force Delete Uploaded File?'}
+                </h3>
+                <p className="text-xs text-slate-400">
+                  Uploaded chunk data is kept permanently until you force-delete it.
+                </p>
+              </div>
+            </div>
+
+            <div className={`p-3 rounded-xl border text-xs space-y-1.5 ${isDark ? 'bg-rose-950/30 border-rose-900/50 text-rose-200' : 'bg-rose-50 border-rose-200 text-rose-800'}`}>
+              {forceDeleteModal.mode === 'single' ? (
+                <>
+                  <p>
+                    You are about to permanently remove <strong>{forceDeleteModal.doc.fileName}</strong> ({forceDeleteModal.doc.chunksCount} chunks).
+                  </p>
+                  <p className="opacity-85">
+                    {(githubConfig.token || serverGithubConfigured) && forceDeleteModal.doc.syncedToGithub !== false
+                      ? `This will commit the deletion to GitHub (${githubConfig.owner}/${githubConfig.repo}/${githubConfig.filePath}) and remove it for all users on all devices.`
+                      : forceDeleteModal.doc.syncedToGithub
+                      ? 'Note: No GitHub write token is configured in this browser, so this only removes your local copy unless you configure GitHub Sync.'
+                      : 'This pending local document and its chunks will be permanently removed.'}
+                  </p>
+                </>
+              ) : (
+                <>
+                  <p>
+                    This will permanently delete all <strong>{documents.length} document(s)</strong> and <strong>{clientChunks.length} chunks</strong>.
+                  </p>
+                  <p className="font-semibold">Type <code className="px-1.5 py-0.5 rounded bg-rose-900/50 text-white">FORCE DELETE ALL</code> below to confirm:</p>
+                  <input
+                    type="text"
+                    value={forceDeleteConfirmText}
+                    onChange={(e) => setForceDeleteConfirmText(e.target.value)}
+                    placeholder="FORCE DELETE ALL"
+                    className={`w-full mt-1 px-3 py-2 text-xs font-mono rounded-lg border focus:outline-none focus:ring-2 focus:ring-rose-500 ${isDark ? 'bg-slate-950 border-rose-800 text-white' : 'bg-white border-rose-300 text-slate-900'}`}
+                  />
+                </>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => {
+                  setForceDeleteModal(null);
+                  setForceDeleteConfirmText('');
+                }}
+                disabled={isForceDeleting}
+                className={`px-3 py-1.5 rounded-xl text-xs font-medium ${isDark ? 'bg-slate-800 text-slate-300 hover:bg-slate-700' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}>
+                Keep File
+              </button>
+              <button
+                onClick={executeForceDelete}
+                disabled={isForceDeleting || (forceDeleteModal.mode === 'all' && forceDeleteConfirmText.trim() !== 'FORCE DELETE ALL')}
+                className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-rose-600 text-white hover:bg-rose-500 disabled:opacity-50 shadow-md shadow-rose-600/20">
+                {isForceDeleting ? 'Force Deleting...' : 'Force Delete Permanently'}
               </button>
             </div>
           </div>

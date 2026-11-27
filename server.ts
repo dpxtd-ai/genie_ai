@@ -1,6 +1,7 @@
-import express, { Request, Response } from 'express';
+import express, { Request, Response, NextFunction } from 'express';
 import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI } from '@google/genai';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -712,11 +713,148 @@ function createChunks(cleanedText: string, docId: string, title: string, departm
 }
 
 // ==========================================
+// Admin Authentication (HMAC Bearer Tokens)
+// ==========================================
+const ADMIN_SESSION_SECRET = process.env.ADMIN_SESSION_SECRET || crypto.randomBytes(32).toString('hex');
+const DEFAULT_ADMIN_SCRYPT_SALT = '71e40420db3f6afec4438df2469ae6f9';
+const DEFAULT_ADMIN_SCRYPT_HASH = 'be4d61c7fd2477a1a61bef7e8a0ba6d7a56c755c5ed96d444ec5afc8ffb55b35ebdbcf78404b1f2cc1e4bd79455723dc7a9f929ebdf39e92c32659f7bdeb9a22';
+const revokedAdminTokens = new Set<string>();
+
+function timingSafeStringMatch(a: string, b: string): boolean {
+  const hashA = crypto.createHash('sha256').update(a).digest();
+  const hashB = crypto.createHash('sha256').update(b).digest();
+  return crypto.timingSafeEqual(hashA, hashB);
+}
+
+function verifyAdminCredentials(usernameInput: string, passwordInput: string): boolean {
+  const expectedUsername = (process.env.ADMIN_USERNAME || 'admin').trim();
+  if (!timingSafeStringMatch(usernameInput.trim(), expectedUsername)) {
+    return false;
+  }
+
+  const envPassword = process.env.ADMIN_PASSWORD || '';
+  if (envPassword.length > 0) {
+    return timingSafeStringMatch(passwordInput, envPassword);
+  }
+
+  const envHash = (process.env.ADMIN_PASSWORD_HASH || '').trim();
+  if (envHash.includes(':')) {
+    const [salt, expectedHex] = envHash.split(':', 2);
+    if (salt && expectedHex && /^[0-9a-f]+$/i.test(expectedHex)) {
+      const derived = crypto.scryptSync(passwordInput, salt, 64);
+      const expectedBuf = Buffer.from(expectedHex, 'hex');
+      if (derived.length === expectedBuf.length) {
+        return crypto.timingSafeEqual(derived, expectedBuf);
+      }
+    }
+    return false;
+  }
+
+  const derived = crypto.scryptSync(passwordInput, DEFAULT_ADMIN_SCRYPT_SALT, 64);
+  const expectedBuf = Buffer.from(DEFAULT_ADMIN_SCRYPT_HASH, 'hex');
+  return crypto.timingSafeEqual(derived, expectedBuf);
+}
+
+function signAdminToken(username: string): { token: string; expiresAt: number } {
+  const now = Date.now();
+  const expiresAt = now + 12 * 60 * 60 * 1000;
+  const payload = {
+    sub: username,
+    role: 'admin',
+    jti: crypto.randomBytes(16).toString('hex'),
+    iat: now,
+    exp: expiresAt
+  };
+  const encodedPayload = Buffer.from(JSON.stringify(payload), 'utf-8').toString('base64url');
+  const sig = crypto.createHmac('sha256', ADMIN_SESSION_SECRET).update(encodedPayload).digest('base64url');
+  return { token: `${encodedPayload}.${sig}`, expiresAt };
+}
+
+function verifyAdminToken(token: string): { sub: string; role: string; jti: string; exp: number } | null {
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [encodedPayload, sig] = parts;
+  if (!encodedPayload || !sig) return null;
+
+  const expectedSig = crypto.createHmac('sha256', ADMIN_SESSION_SECRET).update(encodedPayload).digest('base64url');
+  const sigBuf = Buffer.from(sig, 'utf-8');
+  const expectedBuf = Buffer.from(expectedSig, 'utf-8');
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+    return null;
+  }
+
+  try {
+    const decoded = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf-8'));
+    if (!decoded || decoded.role !== 'admin' || typeof decoded.exp !== 'number' || Date.now() > decoded.exp) {
+      return null;
+    }
+    if (decoded.jti && revokedAdminTokens.has(String(decoded.jti))) {
+      return null;
+    }
+    return decoded;
+  } catch {
+    return null;
+  }
+}
+
+function extractBearerToken(req: Request): string {
+  const auth = req.headers.authorization || '';
+  if (!auth.startsWith('Bearer ')) return '';
+  return auth.slice(7).trim();
+}
+
+function requireAdminAuth(req: Request, res: Response, next: NextFunction) {
+  const token = extractBearerToken(req);
+  const claims = token ? verifyAdminToken(token) : null;
+  if (!claims) {
+    return res.status(401).json({ error: 'Admin authentication required.' });
+  }
+  (req as any).adminUser = claims;
+  next();
+}
+
+app.post(['/api/auth/login', '/api/v1/auth/login'], (req: Request, res: Response) => {
+  const { username, password } = req.body || {};
+  if (typeof username !== 'string' || typeof password !== 'string' || !username.trim() || !password) {
+    return res.status(400).json({ ok: false, error: 'Username and password are required.' });
+  }
+  if (!verifyAdminCredentials(username, password)) {
+    return res.status(401).json({ ok: false, error: 'Invalid admin username or password.' });
+  }
+  const { token, expiresAt } = signAdminToken(username.trim());
+  res.json({
+    ok: true,
+    username: username.trim(),
+    role: 'admin',
+    token,
+    expiresAt
+  });
+});
+
+app.get(['/api/auth/session', '/api/v1/auth/session'], (req: Request, res: Response) => {
+  const token = extractBearerToken(req);
+  const claims = token ? verifyAdminToken(token) : null;
+  if (!claims) {
+    return res.json({ authenticated: false });
+  }
+  res.json({ authenticated: true, username: claims.sub, role: claims.role });
+});
+
+app.post(['/api/auth/logout', '/api/v1/auth/logout'], (req: Request, res: Response) => {
+  const token = extractBearerToken(req);
+  const claims = token ? verifyAdminToken(token) : null;
+  if (claims?.jti) {
+    revokedAdminTokens.add(String(claims.jti));
+  }
+  res.json({ ok: true });
+});
+
+// ==========================================
 // API Routes matching ASP.NET Core & Studio
 // ==========================================
 
 // Force Clear All Documents (explicit force delete only)
-app.post(['/api/documents/clear-all', '/api/v1/documents/clear-all'], async (req: Request, res: Response) => {
+app.post(['/api/documents/clear-all', '/api/v1/documents/clear-all'], requireAdminAuth, async (req: Request, res: Response) => {
   documentsDatabase.clear();
   chunksDatabase.clear();
   persistVectorStoreToFile();
@@ -748,7 +886,7 @@ app.get(['/api/global-store', '/api/v1/global-store'], async (req: Request, res:
 });
 
 // Test GitHub Repository Connection (validates repo, branch & token without logging secrets)
-app.post(['/api/github/test', '/api/v1/github/test'], async (req: Request, res: Response) => {
+app.post(['/api/github/test', '/api/v1/github/test'], requireAdminAuth, async (req: Request, res: Response) => {
   const { owner, repo, branch, filePath, token } = req.body || {};
   const cfg = getServerGithubConfig({ owner, repo, branch, filePath, token });
   const err = validateGithubParams(cfg);
@@ -793,7 +931,7 @@ app.post(['/api/github/test', '/api/v1/github/test'], async (req: Request, res: 
 });
 
 // Manual / On-demand Server GitHub Sync
-app.post(['/api/github/sync', '/api/v1/github/sync'], async (req: Request, res: Response) => {
+app.post(['/api/github/sync', '/api/v1/github/sync'], requireAdminAuth, async (req: Request, res: Response) => {
   const { owner, repo, branch, filePath, token, documents: extraDocs, chunks: extraChunks } = req.body || {};
   if (Array.isArray(extraDocs) || Array.isArray(extraChunks)) {
     ingestStoreJsonIntoMemory(JSON.stringify({ documents: extraDocs || [], chunks: extraChunks || [] }));
@@ -956,7 +1094,7 @@ No relevant vector documents were found in the knowledge base matching **"${ques
 }
 
 // API Key Validation Endpoint
-app.post(['/api/gemini/validate-key', '/api/v1/gemini/validate-key'], async (req: Request, res: Response) => {
+app.post(['/api/gemini/validate-key', '/api/v1/gemini/validate-key'], requireAdminAuth, async (req: Request, res: Response) => {
   const { apiKey } = req.body;
   if (!apiKey || typeof apiKey !== 'string' || apiKey.trim().length === 0) {
     return res.status(400).json({ valid: false, error: 'API key is required' });
@@ -1314,7 +1452,7 @@ async function extractTextFromFile(fileName: string, base64Data: string, rawText
 }
 
 // Upload file endpoint for PDF, CSV, TXT, Word DOCX
-app.post(['/api/documents/upload-file', '/api/v1/documents/upload-file'], async (req: Request, res: Response) => {
+app.post(['/api/documents/upload-file', '/api/v1/documents/upload-file'], requireAdminAuth, async (req: Request, res: Response) => {
   try {
     const { fileName, base64Data, rawText, title, department = 'General', requiredSecurityRole = 'Public' } = req.body;
     if (!fileName || (!base64Data && !rawText)) {
@@ -1403,7 +1541,7 @@ app.post(['/api/rag/search-only', '/api/v1/rag/search-only'], async (req: Reques
 });
 
 // Steps 2, 3, 4, 5: Ingest Document
-app.post(['/api/documents/ingest', '/api/v1/documents/ingest'], async (req: Request, res: Response) => {
+app.post(['/api/documents/ingest', '/api/v1/documents/ingest'], requireAdminAuth, async (req: Request, res: Response) => {
   const { title, content, fileName, department = 'General', requiredSecurityRole = 'Public', chunkSize = 400, chunkOverlap = 80 } = req.body;
   if (!title || !content) {
     return res.status(400).json({ error: 'Title and content are required.' });
@@ -1463,7 +1601,7 @@ app.get(['/api/documents', '/api/v1/documents'], (req: Request, res: Response) =
 });
 
 // Force Delete Document
-app.delete(['/api/documents/:id', '/api/v1/documents/:id'], async (req: Request, res: Response) => {
+app.delete(['/api/documents/:id', '/api/v1/documents/:id'], requireAdminAuth, async (req: Request, res: Response) => {
   const { id } = req.params;
   documentsDatabase.delete(id);
   for (const [chunkId, chunk] of chunksDatabase.entries()) {
@@ -1530,14 +1668,14 @@ function scanDirectory(dir: string, baseDir: string): Array<{ path: string; name
   return entries;
 }
 
-app.get('/api/rag/code-files', (req: Request, res: Response) => {
+app.get('/api/rag/code-files', requireAdminAuth, (req: Request, res: Response) => {
   const ragDir = path.resolve(__dirname, 'rag_llm');
   const files = scanDirectory(ragDir, ragDir);
   res.json(files);
 });
 
 // Download ZIP of /rag_llm
-app.get('/api/rag/download-zip', async (req: Request, res: Response) => {
+app.get('/api/rag/download-zip', requireAdminAuth, async (req: Request, res: Response) => {
   try {
     const ragDir = path.resolve(__dirname, 'rag_llm');
     const zip = new JSZip();

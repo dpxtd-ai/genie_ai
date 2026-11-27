@@ -36,7 +36,11 @@ import {
   ChevronUp,
   Globe,
   Cloud,
-  AlertTriangle
+  AlertTriangle,
+  Lock,
+  LogIn,
+  LogOut,
+  User
 } from 'lucide-react';
 import { INTERVIEW_QUESTIONS } from './interviewData';
 import {
@@ -255,12 +259,42 @@ function scoreChunkRelevance(
   return { score: finalScore, matchedWords };
 }
 
+const STATIC_ADMIN_SALT = 'genie-rag-static-v1:';
+const STATIC_ADMIN_SHA256 = '81c7dc8b5a74753405c0ca868cd55f8c6e219fc5ff57006b359ff3ca5b9d6c9b';
+
+async function sha256HexBrowser(input: string): Promise<string> {
+  const bytes = new TextEncoder().encode(input);
+  const digest = await window.crypto.subtle.digest('SHA-256', bytes);
+  return Array.from(new Uint8Array(digest))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
 export default function App() {
   const [theme, setTheme] = useState<'dark' | 'light'>(() => {
     return (localStorage.getItem('genie_theme') as 'dark' | 'light') || 'dark';
   });
   const [activeOption, setActiveOption] = useState<'upload' | 'chat' | 'docs'>('chat');
   const [showCodeModal, setShowCodeModal] = useState(false);
+
+  // Admin Authentication State (kept strictly in React memory; hidden on initial load)
+  const [adminToken, setAdminToken] = useState<string>('');
+  const [adminUsername, setAdminUsername] = useState<string>('');
+  const [showLoginModal, setShowLoginModal] = useState(false);
+  const [loginUsername, setLoginUsername] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [loginError, setLoginError] = useState<string | null>(null);
+  const [isLoggingIn, setIsLoggingIn] = useState(false);
+  const isAdmin = Boolean(adminToken);
+
+  const getAdminHeaders = (extra?: Record<string, string>, tokenOverride?: string): Record<string, string> => {
+    const token = tokenOverride !== undefined ? tokenOverride : adminToken;
+    const headers: Record<string, string> = { ...(extra || {}) };
+    if (token && !token.startsWith('static-session:')) {
+      headers.Authorization = `Bearer ${token}`;
+    }
+    return headers;
+  };
 
   // Option 1: Upload Documents State (persisted to localStorage for offline/GitHub Pages/DB disconnects)
   const [documents, setDocuments] = useState<StoredDoc[]>(() => {
@@ -429,7 +463,7 @@ export default function App() {
     try {
       const res = await fetch(buildApiUrl('/api/gemini/validate-key', githubConfig), {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({ apiKey: keyInput.trim() })
       });
       if (res.ok) {
@@ -480,7 +514,6 @@ export default function App() {
 
   useEffect(() => {
     fetchDocuments();
-    fetchCodeFiles();
   }, []);
 
   useEffect(() => {
@@ -796,9 +829,11 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
     }
   ];
 
-  const fetchCodeFiles = async () => {
+  const fetchCodeFiles = async (tokenOverride?: string) => {
     try {
-      const res = await fetch(buildApiUrl('/api/rag/code-files', githubConfig));
+      const res = await fetch(buildApiUrl('/api/rag/code-files', githubConfig), {
+        headers: getAdminHeaders(undefined, tokenOverride)
+      });
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data) && data.length > 0) {
@@ -817,8 +852,136 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
     setSelectedFile(fallbacks[0]);
   };
 
+  const handleAdminLogin = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const user = loginUsername.trim();
+    const pass = loginPassword;
+    if (!user || !pass) {
+      setLoginError('Please enter both username and password.');
+      return;
+    }
+
+    setIsLoggingIn(true);
+    setLoginError(null);
+    let backendAvailable = false;
+
+    try {
+      const res = await fetch(buildApiUrl('/api/auth/login', githubConfig), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username: user, password: pass })
+      });
+
+      if (res.status !== 404 && res.status !== 405) {
+        backendAvailable = true;
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && data.token) {
+          setAdminToken(data.token);
+          setAdminUsername(data.username || user);
+          setShowLoginModal(false);
+          setLoginPassword('');
+          setLoginError(null);
+          fetchCodeFiles(data.token);
+          setIsLoggingIn(false);
+          return;
+        }
+        setLoginError(data.error || 'Invalid admin username or password.');
+        setIsLoggingIn(false);
+        return;
+      }
+    } catch {
+      // Backend unavailable (static GitHub Pages mode)
+    }
+
+    if (!backendAvailable) {
+      try {
+        const digestHex = await sha256HexBrowser(STATIC_ADMIN_SALT + pass);
+        if (user === 'admin' && digestHex === STATIC_ADMIN_SHA256) {
+          const staticToken = `static-session:${Date.now()}`;
+          setAdminToken(staticToken);
+          setAdminUsername(user);
+          setShowLoginModal(false);
+          setLoginPassword('');
+          setLoginError(null);
+          fetchCodeFiles(staticToken);
+          setIsLoggingIn(false);
+          return;
+        }
+      } catch {
+        // Fallback error handled below
+      }
+      setLoginError('Invalid admin username or password.');
+    }
+    setIsLoggingIn(false);
+  };
+
+  const handleAdminLogout = async () => {
+    const currentToken = adminToken;
+    setAdminToken('');
+    setAdminUsername('');
+    if (activeOption === 'upload') {
+      setActiveOption('chat');
+    }
+    setShowGithubModal(false);
+    setShowKeyModal(false);
+    setShowCodeModal(false);
+    setForceDeleteModal(null);
+
+    if (currentToken && !currentToken.startsWith('static-session:')) {
+      try {
+        await fetch(buildApiUrl('/api/auth/logout', githubConfig), {
+          method: 'POST',
+          headers: getAdminHeaders(undefined, currentToken)
+        });
+      } catch {
+        // Ignore network errors on logout
+      }
+    }
+  };
+
+  const handleDownloadCodebaseZip = async () => {
+    if (!isAdmin) return;
+    try {
+      const res = await fetch(buildApiUrl('/api/rag/download-zip', githubConfig), {
+        headers: getAdminHeaders()
+      });
+      if (res.ok) {
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'rag_llm_angular_dotnet.zip';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        return;
+      }
+    } catch {
+      // Static fallback below
+    }
+
+    const files = codeFiles.length > 0 ? codeFiles : getFallbackCodeFiles();
+    const zip = new JSZip();
+    for (const f of files) {
+      if (!f.isDir && f.content) {
+        zip.file(f.path, f.content);
+      }
+    }
+    const blob = await zip.generateAsync({ type: 'blob' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'rag_llm_angular_dotnet.zip';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  };
+
   // Option 1: File Upload Handler
   const handleFileUpload = async (file: File) => {
+    if (!isAdmin) return;
     setIsUploading(true);
     setUploadMessage(null);
 
@@ -833,7 +996,7 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
         try {
           const res = await fetch(buildApiUrl('/api/documents/upload-file', githubConfig), {
             method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
+            headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
             body: JSON.stringify({
               fileName: file.name,
               base64Data,
@@ -1033,7 +1196,7 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
       if (!cfg.token && canUseServer) {
         const serverResp = await fetch(buildApiUrl('/api/github/sync', cfg), {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({
             owner: cfg.owner,
             repo: cfg.repo,
@@ -1101,7 +1264,7 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
       if (!githubConfig.token && canUseServer) {
         const serverResp = await fetch(buildApiUrl('/api/github/sync', githubConfig), {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
           body: JSON.stringify({
             owner: githubConfig.owner,
             repo: githubConfig.repo,
@@ -1164,7 +1327,8 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
         let serverDeletedOnGithub = false;
         try {
           const delRes = await fetch(buildApiUrl(`/api/documents/${encodeURIComponent(targetId)}`, githubConfig), {
-            method: 'DELETE'
+            method: 'DELETE',
+            headers: getAdminHeaders()
           });
           if (delRes.ok) {
             const delData = await delRes.json().catch(() => ({}));
@@ -1204,7 +1368,10 @@ Full documentation of the 8-step pipeline, sentence-aware sliding window chunkin
       } else {
         let serverClearedOnGithub = false;
         try {
-          const clearRes = await fetch(buildApiUrl('/api/documents/clear-all', githubConfig), { method: 'POST' });
+          const clearRes = await fetch(buildApiUrl('/api/documents/clear-all', githubConfig), {
+            method: 'POST',
+            headers: getAdminHeaders()
+          });
           if (clearRes.ok) {
             const clearData = await clearRes.json().catch(() => ({}));
             serverClearedOnGithub = Boolean(clearData?.githubSync?.synced);
@@ -1506,19 +1673,21 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
             </div>
           </div>
 
-          {/* Center 3-Option Switcher & Theme Toggle */}
+          {/* Header Navigation Switcher, Theme Toggle & Admin Controls */}
           <div className="flex items-center gap-2">
             <div className={`flex items-center p-1 rounded-xl border ${isDark ? 'bg-slate-950 border-slate-800' : 'bg-slate-100 border-slate-200'}`}>
-              <button
-                onClick={() => setActiveOption('upload')}
-                className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all ${
-                  activeOption === 'upload'
-                    ? 'bg-indigo-600 text-white font-semibold shadow-xs'
-                    : isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-900'
-                }`}>
-                <UploadCloud className="w-3.5 h-3.5" />
-                <span>1. Upload</span>
-              </button>
+              {isAdmin && (
+                <button
+                  onClick={() => setActiveOption('upload')}
+                  className={`px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-all ${
+                    activeOption === 'upload'
+                      ? 'bg-indigo-600 text-white font-semibold shadow-xs'
+                      : isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-900'
+                  }`}>
+                  <UploadCloud className="w-3.5 h-3.5" />
+                  <span>1. Upload</span>
+                </button>
+              )}
 
               <button
                 onClick={() => setActiveOption('chat')}
@@ -1528,7 +1697,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
                     : isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-900'
                 }`}>
                 <MessageSquare className="w-3.5 h-3.5" />
-                <span>2. AI Chat</span>
+                <span>{isAdmin ? '2. AI Chat' : 'AI Chat'}</span>
               </button>
 
               <button
@@ -1539,7 +1708,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
                     : isDark ? 'text-slate-400 hover:text-slate-200' : 'text-slate-600 hover:text-slate-900'
                 }`}>
                 <BookOpen className="w-3.5 h-3.5" />
-                <span>3. Docs &amp; Interview</span>
+                <span>{isAdmin ? '3. Docs & Interview' : 'Docs & Interview'}</span>
               </button>
             </div>
 
@@ -1551,48 +1720,76 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
               {isDark ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
             </button>
 
-            {/* GitHub Global Store Sync Button */}
-            <button
-              onClick={() => {
-                setGhDraft(githubConfig);
-                setGithubTestResult(null);
-                setShowGithubModal(true);
-              }}
-              className={`px-2.5 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 transition-colors border ${
-                githubConfig.token || serverGithubConfigured
-                  ? 'bg-sky-500/10 text-sky-400 border-sky-500/30 hover:bg-sky-500/20'
-                  : isDark ? 'bg-slate-900 hover:bg-slate-800 text-slate-300 border-slate-800' : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200 shadow-xs'
-              }`}
-              title="Configure Global GitHub Chunk Storage">
-              <Globe className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">GitHub Sync</span>
-              {(githubConfig.token || serverGithubConfigured) && <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />}
-            </button>
+            {isAdmin ? (
+              <>
+                {/* GitHub Global Store Sync Button */}
+                <button
+                  onClick={() => {
+                    setGhDraft(githubConfig);
+                    setGithubTestResult(null);
+                    setShowGithubModal(true);
+                  }}
+                  className={`px-2.5 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 transition-colors border ${
+                    githubConfig.token || serverGithubConfigured
+                      ? 'bg-sky-500/10 text-sky-400 border-sky-500/30 hover:bg-sky-500/20'
+                      : isDark ? 'bg-slate-900 hover:bg-slate-800 text-slate-300 border-slate-800' : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200 shadow-xs'
+                  }`}
+                  title="Configure Global GitHub Chunk Storage">
+                  <Globe className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">GitHub Sync</span>
+                  {(githubConfig.token || serverGithubConfigured) && <span className="w-1.5 h-1.5 rounded-full bg-sky-400" />}
+                </button>
 
-            {/* AI Key Configuration Button */}
-            <button
-              onClick={() => {
-                setKeyInput(customApiKey);
-                setShowKeyModal(true);
-              }}
-              className={`px-2.5 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 transition-colors border ${
-                customApiKey
-                  ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20'
-                  : isDark ? 'bg-slate-900 hover:bg-slate-800 text-slate-300 border-slate-800' : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200 shadow-xs'
-              }`}
-              title="Configure Gemini API Key">
-              <Key className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">AI Key</span>
-              {customApiKey && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />}
-            </button>
+                {/* AI Key Configuration Button */}
+                <button
+                  onClick={() => {
+                    setKeyInput(customApiKey);
+                    setShowKeyModal(true);
+                  }}
+                  className={`px-2.5 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 transition-colors border ${
+                    customApiKey
+                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30 hover:bg-emerald-500/20'
+                      : isDark ? 'bg-slate-900 hover:bg-slate-800 text-slate-300 border-slate-800' : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200 shadow-xs'
+                  }`}
+                  title="Configure Gemini API Key">
+                  <Key className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">AI Key</span>
+                  {customApiKey && <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />}
+                </button>
 
-            {/* Code Explorer / Export */}
-            <button
-              onClick={() => setShowCodeModal(true)}
-              className={`p-2 rounded-xl text-xs transition-colors border ${isDark ? 'bg-slate-900 hover:bg-slate-800 text-slate-300 border-slate-800' : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200 shadow-xs'}`}
-              title="Inspect rag_llm Codebase">
-              <Code className="w-4 h-4" />
-            </button>
+                {/* Code Explorer / Export */}
+                <button
+                  onClick={() => {
+                    if (codeFiles.length === 0) fetchCodeFiles();
+                    setShowCodeModal(true);
+                  }}
+                  className={`p-2 rounded-xl text-xs transition-colors border ${isDark ? 'bg-slate-900 hover:bg-slate-800 text-slate-300 border-slate-800' : 'bg-white hover:bg-slate-100 text-slate-700 border-slate-200 shadow-xs'}`}
+                  title="Inspect rag_llm Codebase">
+                  <Code className="w-4 h-4" />
+                </button>
+
+                {/* Admin Logout Button */}
+                <button
+                  onClick={handleAdminLogout}
+                  className={`px-2.5 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 transition-colors border ${isDark ? 'bg-rose-500/10 hover:bg-rose-500/20 text-rose-400 border-rose-500/30' : 'bg-rose-50 hover:bg-rose-100 text-rose-600 border-rose-200'}`}
+                  title={`Signed in as ${adminUsername || 'admin'} — Click to logout`}>
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Logout</span>
+                </button>
+              </>
+            ) : (
+              /* Red-Highlighted Admin Login Button (shown on load until admin logs in) */
+              <button
+                onClick={() => {
+                  setLoginError(null);
+                  setShowLoginModal(true);
+                }}
+                className="px-3 py-1.5 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-all bg-rose-600 hover:bg-rose-500 text-white border border-rose-500 shadow-md shadow-rose-600/25"
+                title="Admin Login">
+                <Lock className="w-3.5 h-3.5" />
+                <span>Login</span>
+              </button>
+            )}
           </div>
         </div>
       </header>
@@ -1603,7 +1800,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
         {/* ============================================================ */}
         {/* OPTION 1: UPLOAD DOCUMENTS (PDF, CSV, TEXT, WORD DOCS)      */}
         {/* ============================================================ */}
-        {activeOption === 'upload' && (
+        {isAdmin && activeOption === 'upload' && (
           <div className="space-y-6 animate-fadeIn">
             {/* Upload Box */}
             <div className={`border rounded-2xl p-6 shadow-xl transition-colors ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200 shadow-sm'}`}>
@@ -1999,13 +2196,14 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
                   </p>
                 </div>
 
-                <a
-                  href={buildApiUrl('/api/rag/download-zip', githubConfig)}
-                  download="rag_llm_angular_dotnet.zip"
-                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-md shadow-indigo-600/20 transition-all shrink-0">
-                  <Download className="w-4 h-4" />
-                  <span>Download Codebase (.ZIP)</span>
-                </a>
+                {isAdmin && (
+                  <button
+                    onClick={handleDownloadCodebaseZip}
+                    className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white rounded-xl text-xs font-semibold flex items-center gap-1.5 shadow-md shadow-indigo-600/20 transition-all shrink-0">
+                    <Download className="w-4 h-4" />
+                    <span>Download Codebase (.ZIP)</span>
+                  </button>
+                )}
               </div>
             </div>
 
@@ -2355,7 +2553,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
       </main>
 
       {/* Code Modal */}
-      {showCodeModal && (
+      {isAdmin && showCodeModal && (
         <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
           <div className={`border rounded-2xl max-w-4xl w-full h-[85vh] flex flex-col overflow-hidden shadow-2xl transition-colors ${isDark ? 'bg-slate-900 border-slate-800' : 'bg-white border-slate-200'}`}>
             <div className={`p-4 border-b flex justify-between items-center ${isDark ? 'border-slate-800' : 'border-slate-200'}`}>
@@ -2365,13 +2563,12 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
               </div>
 
               <div className="flex items-center gap-2">
-                <a
-                  href={buildApiUrl('/api/rag/download-zip', githubConfig)}
-                  download="rag_llm_angular_dotnet.zip"
+                <button
+                  onClick={handleDownloadCodebaseZip}
                   className={`px-3 py-1 border rounded-lg text-xs flex items-center gap-1.5 transition-colors ${isDark ? 'bg-slate-800 hover:bg-slate-700 text-slate-200 border-slate-700' : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-300'}`}>
                   <Download className="w-3.5 h-3.5" />
                   <span>Download ZIP</span>
-                </a>
+                </button>
                 <button
                   onClick={() => setShowCodeModal(false)}
                   className={`p-1 rounded-lg ${isDark ? 'text-slate-400 hover:text-white' : 'text-slate-500 hover:text-slate-900'}`}>
@@ -2433,7 +2630,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
       )}
 
       {/* AI Key Configuration Modal */}
-      {showKeyModal && (
+      {isAdmin && showKeyModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
           <div className={`w-full max-w-lg rounded-2xl border p-6 shadow-2xl flex flex-col gap-4 ${isDark ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200 text-slate-900'}`}>
             <div className="flex items-center justify-between pb-3 border-b border-slate-800/20">
@@ -2552,7 +2749,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
       )}
 
       {/* GitHub Global Store Configuration Modal */}
-      {showGithubModal && (
+      {isAdmin && showGithubModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
           <div className={`w-full max-w-lg rounded-2xl border p-6 shadow-2xl flex flex-col gap-4 ${isDark ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200 text-slate-900'}`}>
             <div className="flex items-center justify-between pb-3 border-b border-slate-800/20">
@@ -2666,7 +2863,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
                       try {
                         const apiRes = await fetch(buildApiUrl('/api/github/test', ghDraft), {
                           method: 'POST',
-                          headers: { 'Content-Type': 'application/json' },
+                          headers: getAdminHeaders({ 'Content-Type': 'application/json' }),
                           body: JSON.stringify(ghDraft)
                         });
                         if (apiRes.ok) {
@@ -2747,7 +2944,7 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
       )}
 
       {/* Force Delete Confirmation Modal (Prevents Accidental Data Loss) */}
-      {forceDeleteModal && (
+      {isAdmin && forceDeleteModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-xs">
           <div className={`w-full max-w-md rounded-2xl border p-6 shadow-2xl flex flex-col gap-4 ${isDark ? 'bg-slate-900 border-rose-900/60 text-white' : 'bg-white border-rose-200 text-slate-900'}`}>
             <div className="flex items-center gap-3">
@@ -2813,6 +3010,100 @@ Use clean markdown with headings (###), bold key terms, bullet points, and code 
               </button>
             </div>
           </div>
+        </div>
+      )}
+      {/* Admin Login Modal */}
+      {showLoginModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/75 backdrop-blur-xs">
+          <form
+            onSubmit={handleAdminLogin}
+            className={`w-full max-w-sm rounded-2xl border p-6 shadow-2xl flex flex-col gap-4 ${isDark ? 'bg-slate-900 border-slate-800 text-white' : 'bg-white border-slate-200 text-slate-900'}`}>
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-rose-500/15 text-rose-500 flex items-center justify-center">
+                  <Lock className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-sm">Admin Login</h3>
+                  <p className={`text-[11px] ${isDark ? 'text-slate-400' : 'text-slate-500'}`}>
+                    Sign in to access Upload, GitHub Sync, AI Key &amp; Code Explorer
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowLoginModal(false);
+                  setLoginError(null);
+                }}
+                className={`p-1 rounded-lg text-xs ${isDark ? 'text-slate-400 hover:text-white' : 'text-slate-500 hover:text-slate-900'}`}>
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className={`block text-[11px] font-medium mb-1 ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
+                  Username
+                </label>
+                <div className="relative">
+                  <User className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="text"
+                    value={loginUsername}
+                    onChange={(e) => setLoginUsername(e.target.value)}
+                    placeholder="admin"
+                    autoComplete="username"
+                    autoFocus
+                    className={`w-full pl-9 pr-3 py-2 text-xs rounded-xl border focus:outline-none focus:ring-2 focus:ring-rose-500 ${isDark ? 'bg-slate-950 border-slate-800 text-white placeholder-slate-500' : 'bg-slate-50 border-slate-200 text-slate-900 placeholder-slate-400'}`}
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className={`block text-[11px] font-medium mb-1 ${isDark ? 'text-slate-300' : 'text-slate-700'}`}>
+                  Password
+                </label>
+                <div className="relative">
+                  <Lock className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                  <input
+                    type="password"
+                    value={loginPassword}
+                    onChange={(e) => setLoginPassword(e.target.value)}
+                    placeholder="Enter admin password"
+                    autoComplete="current-password"
+                    className={`w-full pl-9 pr-3 py-2 text-xs rounded-xl border focus:outline-none focus:ring-2 focus:ring-rose-500 ${isDark ? 'bg-slate-950 border-slate-800 text-white placeholder-slate-500' : 'bg-slate-50 border-slate-200 text-slate-900 placeholder-slate-400'}`}
+                  />
+                </div>
+              </div>
+
+              {loginError && (
+                <div className="p-2.5 rounded-xl border border-rose-500/30 bg-rose-500/10 text-rose-400 text-xs flex items-center gap-2">
+                  <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                  <span>{loginError}</span>
+                </div>
+              )}
+            </div>
+
+            <div className="flex justify-end gap-2 pt-2 border-t border-slate-800/20">
+              <button
+                type="button"
+                onClick={() => {
+                  setShowLoginModal(false);
+                  setLoginError(null);
+                }}
+                className={`px-3 py-1.5 rounded-xl text-xs font-medium ${isDark ? 'bg-slate-800 text-slate-300 hover:bg-slate-700' : 'bg-slate-100 text-slate-700 hover:bg-slate-200'}`}>
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={isLoggingIn}
+                className="px-4 py-1.5 rounded-xl text-xs font-semibold bg-rose-600 hover:bg-rose-500 text-white flex items-center gap-1.5 shadow-md shadow-rose-600/25 disabled:opacity-50">
+                <LogIn className="w-3.5 h-3.5" />
+                <span>{isLoggingIn ? 'Signing in...' : 'Sign In'}</span>
+              </button>
+            </div>
+          </form>
         </div>
       )}
     </div>

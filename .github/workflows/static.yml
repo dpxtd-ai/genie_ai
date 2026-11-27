@@ -26,10 +26,7 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  build-and-deploy:
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  build:
     runs-on: ubuntu-latest
     env:
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
@@ -72,19 +69,16 @@ jobs:
         run: |
           TARGET="${{ github.event.inputs.target_app || 'unified' }}"
           echo "Deploying target mode: $TARGET"
-          
+
           if [ "$TARGET" = "angular" ]; then
-            # Deploy Angular directly at root
             rm -rf ./deploy-dist
             mkdir -p ./deploy-dist
             cp -r rag_llm/angular/dist/rag-angular-client/browser/* ./deploy-dist/
           elif [ "$TARGET" = "react" ]; then
-            # Deploy React directly at root
             rm -rf ./deploy-dist
             mkdir -p ./deploy-dist
             cp -r ./dist/* ./deploy-dist/
           else
-            # Unified mode: React at root, Angular at /angular/
             rm -rf ./deploy-dist
             mkdir -p ./deploy-dist
             cp -r ./dist/* ./deploy-dist/
@@ -98,8 +92,16 @@ jobs:
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
+          name: github-pages
           path: './deploy-dist'
 
+  deploy:
+    needs: build
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v5
+        uses: actions/deploy-pages@v4
